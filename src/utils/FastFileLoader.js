@@ -36,6 +36,7 @@ class FastFileLoader {
       this.totalBytes = file.size;
       this.processedBytes = 0;
       this.sampleData = [];
+      this.allData = [];
       this.summary = {
         totalRows: 0,
         columns: [],
@@ -83,13 +84,32 @@ class FastFileLoader {
     const reader = new FileReader();
     let buffer = '';
     let headers = null;
-    let isFirstChunk = true;
 
     return new Promise((resolve, reject) => {
       const processChunk = () => {
         const chunk = file.slice(this.processedBytes, this.processedBytes + this.chunkSize);
         
         if (chunk.size === 0) {
+          if (buffer.trim()) {
+            if (!headers) {
+              headers = this.parseCSVLine(buffer);
+              this.summary.columns = headers;
+            } else {
+              const row = this.parseCSVLine(buffer);
+              if (row.length === headers.length) {
+                this.summary.totalRows++;
+                const rowObj = {};
+                headers.forEach((header, index) => {
+                  rowObj[header] = row[index] || '';
+                });
+                if (this.loadAllRows) {
+                  this.allData.push(rowObj);
+                } else if (this.sampleData.length < this.maxSampleRows) {
+                  this.sampleData.push(rowObj);
+                }
+              }
+            }
+          }
           resolve();
           return;
         }
@@ -97,40 +117,28 @@ class FastFileLoader {
         reader.onload = (e) => {
           try {
             buffer += e.target.result;
-            const lines = buffer.split('\n');
-            
-            // Keep the last incomplete line in buffer
-            buffer = lines.pop() || '';
+            const extraction = this.extractCompleteCSVRecords(buffer);
+            buffer = extraction.remainder;
 
-            if (isFirstChunk && lines.length > 0) {
-              // Extract headers from first line
-              headers = this.parseCSVLine(lines[0]);
-              this.summary.columns = headers;
-              lines.shift(); // Remove header line
-              isFirstChunk = false;
-            }
+            for (const record of extraction.records) {
+              if (!record.trim()) continue;
+              if (!headers) {
+                headers = this.parseCSVLine(record);
+                this.summary.columns = headers;
+                continue;
+              }
 
-            // Process complete lines
-            for (const line of lines) {
-              if (line.trim()) {
+              const row = this.parseCSVLine(record);
+              if (row.length === headers.length) {
                 this.summary.totalRows++;
-                
-                const row = this.parseCSVLine(line);
-                if (row.length === headers.length) {
-                  const rowObj = {};
-                  headers.forEach((header, index) => {
-                    rowObj[header] = row[index] || '';
-                  });
-                  
-                  if (this.loadAllRows) {
-                    // Store ALL rows when loading everything
-                    this.allData.push(rowObj);
-                  } else {
-                    // Add to sample if we haven't reached the limit
-                    if (this.sampleData.length < this.maxSampleRows) {
-                      this.sampleData.push(rowObj);
-                    }
-                  }
+                const rowObj = {};
+                headers.forEach((header, index) => {
+                  rowObj[header] = row[index] || '';
+                });
+                if (this.loadAllRows) {
+                  this.allData.push(rowObj);
+                } else if (this.sampleData.length < this.maxSampleRows) {
+                  this.sampleData.push(rowObj);
                 }
               }
             }
@@ -153,6 +161,49 @@ class FastFileLoader {
 
       processChunk();
     });
+  }
+
+  extractCompleteCSVRecords(buffer) {
+    const records = [];
+    let inQuotes = false;
+    let start = 0;
+    let i = 0;
+
+    while (i < buffer.length) {
+      const char = buffer[i];
+
+      if (char === '"') {
+        if (inQuotes) {
+          if (i + 1 < buffer.length && buffer[i + 1] === '"') {
+            i += 2;
+            continue;
+          }
+          inQuotes = false;
+          i++;
+          continue;
+        }
+        inQuotes = true;
+        i++;
+        continue;
+      }
+
+      if (!inQuotes && (char === '\n' || char === '\r')) {
+        records.push(buffer.slice(start, i));
+        if (char === '\r' && i + 1 < buffer.length && buffer[i + 1] === '\n') {
+          i++;
+        }
+        i++;
+        start = i;
+        continue;
+      }
+
+      i++;
+    }
+
+    return {
+      records,
+      remainder: buffer.slice(start)
+    };
   }
 
   async processJSONFile(file) {
