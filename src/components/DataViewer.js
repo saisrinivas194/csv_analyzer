@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Download, Eye } from 'lucide-react';
 
 const MAX_DISPLAY_ROWS = 20;
@@ -26,24 +26,18 @@ const DataViewer = ({ csvData, fileName }) => {
   }, [filters]);
 
   useEffect(() => {
-    if (csvData) {
-      applyLocalFilter(debouncedFilters);
-    }
-  }, [csvData, debouncedFilters]);
-
-  useEffect(() => {
     return () => {
       filterJobIdRef.current += 1;
     };
   }, []);
 
-  const applyLocalFilter = (activeFilters) => {
+  const applyLocalFilter = useCallback((activeFilters) => {
     if (!csvData) return;
 
     const currentJobId = ++filterJobIdRef.current;
     const sourceData = csvData;
     const filtered = [];
-    const chunkSize = 1000;
+    const chunkSize = sourceData.length > 100000 ? 500 : 1000;
     let index = 0;
 
     const searchTerm = activeFilters.search.toLowerCase();
@@ -54,9 +48,18 @@ const DataViewer = ({ csvData, fileName }) => {
 
     const rowMatches = (row) => {
       if (searchTerm) {
-        const hasMatch = Object.values(row).some((value) =>
-          String(value).toLowerCase().includes(searchTerm)
-        );
+        // Avoid Object.values allocations for large rows.
+        let hasMatch = false;
+        // eslint-disable-next-line no-restricted-syntax
+        for (const key in row) {
+          const value = row[key];
+          if (value == null) continue;
+          const s = typeof value === 'string' ? value : String(value);
+          if (s && s.toLowerCase().includes(searchTerm)) {
+            hasMatch = true;
+            break;
+          }
+        }
         if (!hasMatch) return false;
       }
 
@@ -96,6 +99,7 @@ const DataViewer = ({ csvData, fileName }) => {
       }
 
       if (index < sourceData.length) {
+        // Yield to the browser to keep typing/scrolling responsive.
         setTimeout(processChunk, 0);
       } else {
         setFilteredData(filtered);
@@ -104,7 +108,13 @@ const DataViewer = ({ csvData, fileName }) => {
     };
 
     setTimeout(processChunk, 0);
-  };
+  }, [csvData]);
+
+  useEffect(() => {
+    if (csvData) {
+      applyLocalFilter(debouncedFilters);
+    }
+  }, [csvData, debouncedFilters, applyLocalFilter]);
 
 
   const handleFilterChange = (filterType, value) => {
