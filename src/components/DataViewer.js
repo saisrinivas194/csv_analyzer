@@ -1,5 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Download, Eye } from 'lucide-react';
+
+const MAX_DISPLAY_ROWS = 20;
 
 const DataViewer = ({ csvData, fileName }) => {
   const [filters, setFilters] = useState({
@@ -12,160 +14,96 @@ const DataViewer = ({ csvData, fileName }) => {
     exchange: ''
   });
   const [filteredData, setFilteredData] = useState([]);
-  const [filterOptions, setFilterOptions] = useState(null);
+  const [debouncedFilters, setDebouncedFilters] = useState(filters);
   const [loading, setLoading] = useState(false);
+  const filterJobIdRef = useRef(0);
 
   useEffect(() => {
-    getFilterOptions();
+    const timer = setTimeout(() => {
+      setDebouncedFilters(filters);
+    }, 200);
+    return () => clearTimeout(timer);
+  }, [filters]);
+
+  useEffect(() => {
+    if (csvData) {
+      applyLocalFilter(debouncedFilters);
+    }
+  }, [csvData, debouncedFilters]);
+
+  useEffect(() => {
+    return () => {
+      filterJobIdRef.current += 1;
+    };
   }, []);
 
-  useEffect(() => {
-    if (csvData) {
-      applyLocalFilter();
-    }
-  }, [csvData, filters]);
-
-  const getFilterOptions = async () => {
-    try {
-      const response = await fetch('http://localhost:5001/api/get_filter_options');
-      if (response.ok) {
-        const options = await response.json();
-        setFilterOptions(options);
-      }
-    } catch (error) {
-      console.error('Failed to get filter options:', error);
-    }
-  };
-
-  const applyBackendFilter = async (filterData) => {
-    setLoading(true);
-    try {
-      const response = await fetch('http://localhost:5001/api/filter', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ filters: filterData })
-      });
-
-      if (response.ok) {
-        const result = await response.json();
-        setFilteredData(result.filtered_data || []);
-      }
-    } catch (error) {
-      console.error('Filter error:', error);
-    }
-    setLoading(false);
-  };
-
-  useEffect(() => {
-    if (csvData) {
-      applyLocalFilter();
-    }
-  }, [csvData, filters]);
-
-  const applyLocalFilter = () => {
+  const applyLocalFilter = (activeFilters) => {
     if (!csvData) return;
-    
-    let filtered = [...csvData];
-    
-    // Search filter
-    if (filters.search) {
-      filtered = filtered.filter(row => 
-        Object.values(row).some(value => 
-          String(value).toLowerCase().includes(filters.search.toLowerCase())
-        )
-      );
-    }
-    
-    // Company filter
-    if (filters.company) {
-      filtered = filtered.filter(row => {
+
+    const currentJobId = ++filterJobIdRef.current;
+    const sourceData = csvData;
+    const filtered = [];
+    const chunkSize = 1000;
+    let index = 0;
+
+    const searchTerm = activeFilters.search.toLowerCase();
+    const companyTerm = activeFilters.company.toLowerCase();
+    const filingTypeTerm = activeFilters.filingType.toLowerCase();
+    const exchangeTerm = activeFilters.exchange.toLowerCase();
+    const columnValueTerm = activeFilters.value.toLowerCase();
+
+    const rowMatches = (row) => {
+      if (searchTerm) {
+        const hasMatch = Object.values(row).some((value) =>
+          String(value).toLowerCase().includes(searchTerm)
+        );
+        if (!hasMatch) return false;
+      }
+
+      if (companyTerm) {
         const companyName = row.company || row.company_name || row.name || '';
-        return String(companyName).toLowerCase().includes(filters.company.toLowerCase());
-      });
-    }
-    
-    // Filing type filter
-    if (filters.filingType) {
-      filtered = filtered.filter(row => {
+        if (!String(companyName).toLowerCase().includes(companyTerm)) return false;
+      }
+
+      if (filingTypeTerm) {
         const filingType = row.filing_type || row.form_type || row.type || '';
-        return String(filingType).toLowerCase().includes(filters.filingType.toLowerCase());
-      });
-    }
-    
-    // Exchange filter
-    if (filters.exchange) {
-      filtered = filtered.filter(row => {
+        if (!String(filingType).toLowerCase().includes(filingTypeTerm)) return false;
+      }
+
+      if (exchangeTerm) {
         const exchange = row.exchange || row.market || '';
-        return String(exchange).toLowerCase().includes(filters.exchange.toLowerCase());
-      });
-    }
-    
-    // Column filter
-    if (filters.column !== 'all' && filters.value) {
-      filtered = filtered.filter(row => 
-        String(row[filters.column]).toLowerCase().includes(filters.value.toLowerCase())
-      );
-    }
-    
-    setFilteredData(filtered);
-  };
+        if (!String(exchange).toLowerCase().includes(exchangeTerm)) return false;
+      }
 
+      if (activeFilters.column !== 'all' && columnValueTerm) {
+        if (!String(row[activeFilters.column] || '').toLowerCase().includes(columnValueTerm)) return false;
+      }
 
-  const calculateKPIs = () => {
-    if (!filteredData || filteredData.length === 0) return null;
-    
-    const companies = new Set();
-    const companyLastActivity = {};
-    const currentDate = new Date();
-    const thirtyDaysAgo = new Date(currentDate.getTime() - (30 * 24 * 60 * 60 * 1000));
-    
-    filteredData.forEach(row => {
-      const companyName = row.company || row.company_name || row.name || row.entity_name || 
-                         row.companyName || row.entityName || row.issuer || 'Unknown';
-      companies.add(companyName);
-      
-      const dateField = row.date || row.filing_date || row.filingDate || row.reportDate || 
-                       row.report_date || row.submissionDate || row.submission_date;
-      if (dateField) {
-        const filingDate = new Date(dateField);
-        if (!companyLastActivity[companyName] || filingDate > companyLastActivity[companyName]) {
-          companyLastActivity[companyName] = filingDate;
+      return true;
+    };
+
+    setLoading(true);
+
+    const processChunk = () => {
+      if (filterJobIdRef.current !== currentJobId) return;
+
+      const end = Math.min(index + chunkSize, sourceData.length);
+      for (; index < end; index++) {
+        const row = sourceData[index];
+        if (rowMatches(row)) {
+          filtered.push(row);
         }
       }
-    });
-    
-    const totalCustomers = companies.size;
-    let activeCustomers = 0;
-    Object.values(companyLastActivity).forEach(lastActivity => {
-      if (lastActivity >= thirtyDaysAgo) {
-        activeCustomers++;
+
+      if (index < sourceData.length) {
+        setTimeout(processChunk, 0);
+      } else {
+        setFilteredData(filtered);
+        setLoading(false);
       }
-    });
-    
-    if (activeCustomers === 0 && Object.keys(companyLastActivity).length === 0) {
-      const companyFilings = {};
-      filteredData.forEach(row => {
-        const companyName = row.company || row.company_name || row.name || row.entity_name || 
-                           row.companyName || row.entityName || row.issuer || 'Unknown';
-        companyFilings[companyName] = (companyFilings[companyName] || 0) + 1;
-      });
-      const companiesWithMultipleFilings = Object.entries(companyFilings)
-        .filter(([, filings]) => filings > 1).length;
-      activeCustomers = Math.max(1, Math.floor(companiesWithMultipleFilings * 0.8));
-    }
-    
-    const averageOrderValue = totalCustomers > 0 ? filteredData.length / totalCustomers : 0;
-    const activityRate = totalCustomers > 0 ? (activeCustomers / totalCustomers) * 100 : 0;
-    
-    return {
-      totalCustomers,
-      activeCustomers,
-      averageOrderValue: parseFloat(averageOrderValue.toFixed(2)),
-      activityRate: parseFloat(activityRate.toFixed(1)),
-      totalRows: filteredData.length
     };
+
+    setTimeout(processChunk, 0);
   };
 
 
@@ -177,7 +115,7 @@ const DataViewer = ({ csvData, fileName }) => {
   };
 
   const handleSearch = () => {
-    applyLocalFilter();
+    applyLocalFilter(filters);
   };
 
   const clearFilters = () => {
@@ -206,7 +144,7 @@ const DataViewer = ({ csvData, fileName }) => {
       // Add header row
       csvRows.push(headers.join(','));
       
-      // Add ALL filtered data rows (not just the displayed 100)
+      // Add ALL filtered data rows (not just the displayed preview rows)
       filteredData.forEach(row => {
         const values = headers.map(header => {
           const value = row[header] || '';
@@ -233,7 +171,7 @@ const DataViewer = ({ csvData, fileName }) => {
         document.body.removeChild(link);
         
         // Show confirmation with actual count
-        alert(`Export successful!\n\nExported ${filteredData.length} rows of filtered data.\n\nNote: Display shows only first 100 rows, but export includes ALL ${filteredData.length} filtered results.`);
+        alert(`Export successful!\n\nExported ${filteredData.length} rows of filtered data.\n\nNote: Display shows only first ${MAX_DISPLAY_ROWS} rows, but export includes ALL ${filteredData.length} filtered results.`);
       }
     } catch (error) {
       console.error('Export error:', error);
@@ -250,7 +188,7 @@ const DataViewer = ({ csvData, fileName }) => {
     );
   }
 
-  const columns = Object.keys(filteredData[0] || {});
+  const columns = Object.keys(csvData[0] || {});
 
   return (
     <div className="card">
@@ -408,7 +346,7 @@ const DataViewer = ({ csvData, fileName }) => {
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredData.slice(0, 100).map((row, index) => (
+                  {filteredData.slice(0, MAX_DISPLAY_ROWS).map((row, index) => (
                     <tr key={index}>
                       {columns.map(col => (
                         <td key={col}>{row[col]}</td>
@@ -419,9 +357,9 @@ const DataViewer = ({ csvData, fileName }) => {
               </table>
             </div>
             
-            {filteredData.length > 100 && (
+            {filteredData.length > MAX_DISPLAY_ROWS && (
               <p style={{ fontSize: '0.8rem', color: '#666', marginTop: '8px' }}>
-                Display: Showing first 100 rows of {filteredData.length} total filtered results<br/>
+                Display: Showing first {MAX_DISPLAY_ROWS} rows of {filteredData.length} total filtered results<br/>
                 Export: Will include ALL {filteredData.length} filtered rows
               </p>
             )}
