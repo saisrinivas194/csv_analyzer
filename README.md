@@ -1,113 +1,89 @@
-# CSV Analyzer Frontend
+# CSV Analyzer
 
-A React.js application for analyzing large CSV files and extracting key performance indicators (KPIs).
+A React + Python tool for analyzing large SEC filing CSV files (8-K, 10-K, and others) without browser memory limits.
 
-## Features
+## Architecture
 
-- **File Upload**: Upload CSV files for analysis
-- **KPI Analysis**: Extract key metrics including:
-  - Total Customers (Companies)
-  - Active Customers (Companies filing recently)
-  - Average Order Value (Average filings per company)
-  - Activity Rate
-  - Revenue Mentions
-  - Customer Mentions
-
-- **Data Visualization**: Interactive charts showing:
-  - Exchange distribution (pie chart)
-  - Top companies by filing count (bar chart)
-  - KPI comparison (bar chart)
-
-- **Responsive Design**: Works on desktop and mobile devices
-
-## Technologies Used
-
-- **React.js**: Frontend framework
-- **Recharts**: Data visualization library
-- **Lucide React**: Icon library
-- **CSS3**: Styling with gradients and animations
+```
+csv_analyzer/
+├── src/                  # React frontend
+│   ├── components/
+│   │   ├── FileUpload.js     # Path-based loader (large files) + browser upload (small files)
+│   │   ├── DataViewer.js     # Paginated table with server-side filtering
+│   │   ├── KPIAnalysis.js    # KPI metrics display
+│   │   └── ComponentStyles.css
+│   ├── utils/
+│   │   └── FastFileLoader.js # In-browser CSV parser (small files only)
+│   ├── App.js
+│   └── App.css
+└── backend/              # Python Flask API
+    ├── app.py            # REST API — load, filter, export, search
+    ├── requirements.txt
+    └── start.sh
+```
 
 ## Getting Started
 
-### Prerequisites
+### 1. Start the Python backend
 
-- Node.js (version 14 or higher)
-- npm or yarn
-
-### Installation
-
-1. Navigate to the project directory:
 ```bash
-cd csv-analyzer-frontend
+cd backend
+./start.sh
 ```
 
-2. Install dependencies:
+Runs on `http://localhost:5001`. Required for large files.
+
+### 2. Start the frontend
+
 ```bash
 npm install
+npm run build
+npx serve -s build -l 3000
 ```
 
-3. Start the development server:
-```bash
-npm start
+Open `http://localhost:3000`.
+
+> For development with hot reload use `npm start` instead of build+serve.
+
+## Loading Files
+
+### Large files (hundreds of MB to several GB)
+
+Use **Load from Path** mode (default). Enter the full path to your CSV:
+
+```
+/Users/yourname/Downloads/8k_filings_raw_text_2024.csv
 ```
 
-4. Open [http://localhost:3000](http://localhost:3000) to view it in the browser.
+The Python backend reads the file directly from disk — the browser never loads it into memory. Filtering streams the file in 10,000-row chunks via pandas.
 
-## Project Structure
+### Small files (under ~200 MB)
 
-```
-src/
-├── components/
-│   ├── Header.js              # Navigation header
-│   ├── FileUpload.js          # File upload component
-│   ├── KPIAnalysis.js         # KPI display component
-│   ├── DataVisualization.js   # Charts and graphs
-│   └── ComponentStyles.css    # Component-specific styles
-├── App.js                     # Main application component
-├── App.css                    # Global styles
-└── index.js                   # Application entry point
-```
+Switch to **Upload in Browser** mode. The file is parsed locally in-browser (no backend needed), capped at 100,000 rows.
 
-## Usage
+## Filtering & Search
 
-1. **Upload File**: Click "Choose CSV File" to select a CSV file
-2. **Analyze**: Click "Analyze File" to process the data
-3. **View Results**: Review the KPI metrics and visualizations
-4. **Explore Data**: Use the interactive charts to explore patterns
+- Filters run **server-side** in backend mode — all rows are searched regardless of file size
+- Results are paginated at **100 rows per page** with prev/next controls
+- Supports: keyword search, company name, filing type (8-K, 10-K…), exchange, and per-column value filtering
 
-## Key Metrics Explained
+## Export
 
-- **Total Customers**: Number of unique companies in the dataset
-- **Active Customers**: Companies that have filed reports recently (last 30 days)
-- **Average Order Value**: Average number of filings per company
-- **Activity Rate**: Percentage of companies that are actively filing
-- **Revenue Mentions**: Number of filings containing revenue-related terms
-- **Customer Mentions**: Number of filings containing customer-related terms
+Click **Export Filtered Data** to download the current filtered result set as a CSV.
 
-## Customization
+## Backend API
 
-The application can be customized by:
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/load_path` | POST | Load CSV from a local file path |
+| `/api/upload` | POST | Upload a CSV file directly |
+| `/api/filter` | POST | Filter data with pagination |
+| `/api/export` | POST | Download filtered rows as CSV |
+| `/api/search_full_file` | POST | Keyword search across full file |
+| `/api/status` | GET | Check backend status |
 
-- Modifying the color scheme in `App.css`
-- Adding new chart types in `DataVisualization.js`
-- Extending KPI calculations in `KPIAnalysis.js`
-- Adding new file format support in `FileUpload.js`
+## Tech Stack
 
-## Future Enhancements
-
-- Backend API integration for real-time analysis
-- Export functionality for reports
-- Advanced filtering options
-- Real-time data updates
-- User authentication and data persistence
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Submit a pull request
-
-## License
-
-This project is licensed under the MIT License.# csv_analyzer
+- **Frontend**: React, Lucide React
+- **Backend**: Python, Flask, pandas, numpy
+- **Serving**: `serve` (production build) or `react-scripts start` (dev)
