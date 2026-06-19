@@ -94,41 +94,68 @@ def generate_column_insights(column_name, series):
     
     return insights
 
-def filter_data(filters):
-    """Apply filters to the CSV data"""
-    global csv_data
-    
+def _apply_filters_to_chunk(chunk, filters):
+    """Apply filters to a dataframe chunk. Returns filtered chunk."""
+    search_term = filters.get('search', '').lower()
+    if search_term:
+        text_cols = chunk.select_dtypes(include=['object']).columns
+        mask = pd.Series([False] * len(chunk), index=chunk.index)
+        for col in text_cols:
+            mask |= chunk[col].astype(str).str.lower().str.contains(search_term, na=False)
+        chunk = chunk[mask]
+
+    for column, value in filters.items():
+        if column == 'search' or not value or value == 'all':
+            continue
+        if column in chunk.columns:
+            if chunk[column].dtype == 'object':
+                chunk = chunk[chunk[column].astype(str).str.contains(str(value), case=False, na=False)]
+            else:
+                chunk = chunk[chunk[column] == value]
+
+    return chunk
+
+
+def filter_data(filters, page=1, page_size=100):
+    """Apply filters to the CSV data. Uses chunked reading for large files.
+    Returns (page_rows_df, total_match_count)."""
+    global csv_data, file_info
+
     if csv_data is None:
-        return None
-    
+        return None, 0
+
     try:
-        filtered_df = csv_data.copy()
-        
-        # Apply text search filter
-        if filters.get('search'):
-            search_term = filters['search'].lower()
-            text_columns = filtered_df.select_dtypes(include=['object']).columns
-            
-            mask = pd.Series([False] * len(filtered_df))
-            for col in text_columns:
-                mask |= filtered_df[col].astype(str).str.lower().str.contains(search_term, na=False)
-            
-            filtered_df = filtered_df[mask]
-        
-        # Apply column-specific filters
-        for column, value in filters.items():
-            if column != 'search' and value and value != 'all':
-                if column in filtered_df.columns:
-                    if filtered_df[column].dtype == 'object':
-                        filtered_df = filtered_df[filtered_df[column].astype(str).str.contains(str(value), case=False, na=False)]
-                    else:
-                        filtered_df = filtered_df[filtered_df[column] == value]
-        
-        return filtered_df
-        
+        skip = (page - 1) * page_size
+        collected = []
+        collected_count = 0
+        total_matches = 0
+
+        if file_info and file_info.get('full_file_path') and os.path.exists(file_info['full_file_path']):
+            source = pd.read_csv(file_info['full_file_path'], chunksize=10000, low_memory=False)
+        else:
+            # Wrap small in-memory frame as a single-chunk iterable
+            source = [csv_data.copy()]
+
+        for chunk in source:
+            filtered_chunk = _apply_filters_to_chunk(chunk, filters)
+            chunk_len = len(filtered_chunk)
+            total_matches += chunk_len
+
+            # Collect only the rows belonging to the requested page
+            if collected_count < skip + page_size:
+                chunk_start = max(0, skip - collected_count)
+                chunk_end = skip + page_size - collected_count
+                slice_ = filtered_chunk.iloc[chunk_start:chunk_end]
+                if len(slice_) > 0:
+                    collected.append(slice_)
+                collected_count += chunk_len
+
+        result = pd.concat(collected, ignore_index=True) if collected else pd.DataFrame(columns=csv_data.columns)
+        return result, total_matches
+
     except Exception as e:
         logger.error(f"Error filtering data: {str(e)}")
-        return None
+        return None, 0
 
 def generate_kpis(df):
     """Generate Key Performance Indicators from the data"""
@@ -177,6 +204,52 @@ def generate_kpis(df):
         logger.error(f"Error generating KPIs: {str(e)}")
         return {}
 
+@app.route('/api/load_path', methods=['POST'])
+def load_from_path():
+    """Load a CSV directly from a local file path — avoids uploading large files."""
+    global csv_data, file_info
+
+    data = request.json
+    file_path = (data.get('path') or '').strip()
+
+    if not file_path:
+        return jsonify({'error': 'File path is required'}), 400
+    if not os.path.exists(file_path):
+        return jsonify({'error': f'File not found: {file_path}'}), 400
+
+    try:
+        sample_df = pd.read_csv(file_path, nrows=1000, low_memory=False)
+
+        # Count rows without loading the full file
+        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+            total_rows = sum(1 for _ in f) - 1
+
+        csv_data = sample_df
+        file_info = {
+            'filename': os.path.basename(file_path),
+            'full_file_path': file_path,
+            'is_path_loaded': True,
+            'total_rows': total_rows,
+            'upload_time': datetime.now().isoformat(),
+            'file_size': os.path.getsize(file_path),
+        }
+
+        analysis = analyze_csv_structure(file_path)
+
+        return jsonify({
+            'success': True,
+            'total_rows': total_rows,
+            'columns': list(sample_df.columns),
+            'sample_data': sample_df.head(20).replace({np.nan: None}).to_dict('records'),
+            'file_info': file_info,
+            'analysis': analysis,
+        })
+
+    except Exception as e:
+        logger.error(f"load_path error: {str(e)}")
+        return jsonify({'error': f'Failed to load file: {str(e)}'}), 500
+
+
 @app.route('/api/upload', methods=['POST'])
 def upload_file():
     """Upload and analyze CSV file"""
@@ -205,37 +278,35 @@ def upload_file():
         # Load data for filtering - HYBRID APPROACH
         try:
             logger.info(f"Loading CSV file with hybrid approach: {file_path}")
-            
+
+            file_info = {
+                'filename': file.filename,
+                'upload_time': datetime.now().isoformat(),
+                'file_size': os.path.getsize(file_path),
+                'full_file_path': file_path,
+                'is_sampled': False,
+            }
+
             # For display and initial analysis, use sampling for performance
             csv_data = pd.read_csv(file_path, low_memory=False)
-            
+
             # For very large files, sample for display but keep full file path for search
             if len(csv_data) > 100000:
                 csv_data_sample = csv_data.sample(n=100000, random_state=42)
-                analysis['total_rows'] = len(csv_data)  # Show actual total
-                analysis['sample_rows'] = len(csv_data_sample)  # Show sample size
+                analysis['total_rows'] = len(csv_data)
+                analysis['sample_rows'] = len(csv_data_sample)
                 analysis['data_insights'].append(f"Display sample: {len(csv_data_sample):,} rows | Full dataset: {len(csv_data):,} rows")
-                
-                # Store both sample and full file path
                 csv_data = csv_data_sample
-                file_info['full_file_path'] = file_path
                 file_info['is_sampled'] = True
             else:
                 analysis['total_rows'] = len(csv_data)
                 analysis['data_insights'].append(f"Full dataset loaded: {len(csv_data):,} rows")
-                file_info['is_sampled'] = False
-            
+
             logger.info(f"Successfully loaded {len(csv_data):,} rows for display")
             
         except Exception as e:
             logger.error(f"Error loading CSV: {str(e)}")
             return jsonify({'error': f'Error loading CSV: {str(e)}'}), 500
-        
-        file_info = {
-            'filename': file.filename,
-            'upload_time': datetime.now().isoformat(),
-            'file_size': os.path.getsize(file_path)
-        }
         
         # Clean up temp file
         os.remove(file_path)
@@ -253,24 +324,28 @@ def upload_file():
 
 @app.route('/api/filter', methods=['POST'])
 def filter_data_endpoint():
-    """Apply filters to the data"""
+    """Apply filters to the data with pagination."""
     try:
-        filters = request.json.get('filters', {})
-        
-        filtered_df = filter_data(filters)
-        if filtered_df is None:
+        body = request.json or {}
+        filters = body.get('filters', {})
+        page = int(body.get('page', 1))
+        page_size = int(body.get('page_size', 100))
+
+        page_df, total_matches = filter_data(filters, page=page, page_size=page_size)
+        if page_df is None:
             return jsonify({'error': 'No data available'}), 400
-        
-        # Convert to records for JSON response
+
         result = {
-            'filtered_data': filtered_df.head(1000).to_dict('records'),  # Limit to 1000 rows
-            'total_filtered_rows': len(filtered_df),
-            'columns': list(filtered_df.columns),
-            'kpis': generate_kpis(filtered_df)
+            'filtered_data': page_df.replace({np.nan: None}).to_dict('records'),
+            'total_filtered_rows': total_matches,
+            'page': page,
+            'page_size': page_size,
+            'total_pages': max(1, -(-total_matches // page_size)),
+            'columns': list(page_df.columns),
         }
-        
+
         return jsonify(result)
-        
+
     except Exception as e:
         logger.error(f"Filter error: {str(e)}")
         return jsonify({'error': f'Filter failed: {str(e)}'}), 500
