@@ -15,7 +15,36 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+from flask.json.provider import DefaultJSONProvider
+
+
+def _json_safe(obj):
+    """Convert NaN/Inf to None and numpy/pandas values to plain types (NaN is invalid JSON)."""
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return [_json_safe(v) for v in obj.tolist()]
+    if isinstance(obj, np.generic):
+        obj = obj.item()
+    if isinstance(obj, float) and (np.isnan(obj) or np.isinf(obj)):
+        return None
+    if obj is pd.NaT:
+        return None
+    if isinstance(obj, (pd.Timestamp, datetime)):
+        return obj.isoformat()
+    return obj
+
+
+class SafeJSONProvider(DefaultJSONProvider):
+    def dumps(self, obj, **kwargs):
+        kwargs.setdefault('allow_nan', False)
+        return super().dumps(_json_safe(obj), **kwargs)
+
+
 app = Flask(__name__)
+app.json = SafeJSONProvider(app)
 CORS(app)
 
 # Global variables to store data

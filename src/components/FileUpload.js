@@ -38,12 +38,14 @@ const FileUpload = ({ onAnalysisStart, onAnalysisComplete, onFileRead, isAnalyzi
         body: JSON.stringify({ path: filePath.trim() }),
       });
 
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.error || 'Backend error');
+      const text = await res.text();
+      let result;
+      try {
+        result = JSON.parse(text);
+      } catch {
+        throw new Error(`Backend returned an invalid response (HTTP ${res.status}): ${text.slice(0, 200)}`);
       }
-
-      const result = await res.json();
+      if (!res.ok) throw new Error(result.error || `Backend error (HTTP ${res.status})`);
       setUploadStatus(`Loaded ${result.total_rows.toLocaleString()} rows — displaying first 20, backend handles filtering`);
 
       const analysis = {
