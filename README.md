@@ -61,6 +61,20 @@ The Python backend reads the file directly from disk — the browser never loads
 
 Switch to **Upload in Browser** mode. The file is parsed locally in-browser (no backend needed), capped at 100,000 rows.
 
+## Keyword Snippets (keyword in context)
+
+Filing text columns can hold an entire 10-K per cell, so a normal search returns huge rows. **Keyword Snippets** (shown after loading a file with *Load from Path*) returns only the words around each hit:
+
+- Enter one or more comma-separated terms, e.g. `ARPU, average revenue per user, ARPPU, revenue per subscriber`
+- Choose how many words to keep on each side (default **50**)
+- Optionally narrow by company or form type (10-K, 8-K, 6-K…)
+- Matching is case-insensitive, whole-word (`ARPU` does not match `SARPU`), tolerates line breaks inside phrases, and includes simple plurals (`ARPUs`)
+- Hits that are close together are merged into one snippet, so numbers next to each other aren't split
+- Long text columns (e.g. `section_7`, `text`) are detected automatically; every other column is kept as metadata
+- **Export Snippets CSV** downloads every snippet with its metadata, source row and text column
+
+The first search streams the whole file; paging and export of the same query reuse the cached result.
+
 ## Filtering & Search
 
 - Filters run **server-side** in backend mode — all rows are searched regardless of file size
@@ -78,6 +92,8 @@ Click **Export Filtered Data** to download the current filtered result set as a 
 | `/api/load_path` | POST | Load CSV from a local file path |
 | `/api/upload` | POST | Upload a CSV file directly |
 | `/api/filter` | POST | Filter data with pagination |
+| `/api/snippets` | POST | Keyword-in-context snippets (`terms`, `window`, `filters`, `page`) |
+| `/api/snippets/export` | POST | Download all snippets for a query as CSV |
 | `/api/export` | POST | Download filtered rows as CSV |
 | `/api/search_full_file` | POST | Keyword search across full file |
 | `/api/status` | GET | Check backend status |

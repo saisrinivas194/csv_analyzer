@@ -3,6 +3,7 @@ import './App.css';
 import FileUpload from './components/FileUpload';
 import KPIAnalysis from './components/KPIAnalysis';
 import DataViewer from './components/DataViewer';
+import SnippetSearch from './components/SnippetSearch';
 
 function App() {
   const [analysisData, setAnalysisData] = useState(null);
@@ -34,6 +35,10 @@ function App() {
             onFileRead={handleFileRead}
             isAnalyzing={isAnalyzing}
           />
+
+          {csvData && fileOptions?.backendMode && (
+            <SnippetSearch backendMode />
+          )}
 
           {csvData && (
             <DataViewer
