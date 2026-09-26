@@ -47,21 +47,90 @@ app = Flask(__name__)
 app.json = SafeJSONProvider(app)
 CORS(app, expose_headers=['Content-Disposition'])
 
+MAX_CELL_PREVIEW_CHARS = 400  # long text cells (e.g. whole filings) are cut to this in table/preview responses
+
+
+def _preview_value(v):
+    if isinstance(v, str) and len(v) > MAX_CELL_PREVIEW_CHARS:
+        return f"{v[:MAX_CELL_PREVIEW_CHARS]}… [{len(v):,} chars, use Keyword Snippets or Export for full text]"
+    return v
+
+
+def _preview_records(df):
+    """DataFrame -> records with long text truncated, so the browser never receives whole filings."""
+    return [{k: _preview_value(v) for k, v in row.items()} for row in df.replace({np.nan: None}).to_dict('records')]
+
+
+def _resolve_user_path(raw):
+    """Accept paths the way people paste them: quoted, shell-escaped (My\ Files), ~/..., or file:// URLs."""
+    from urllib.parse import unquote, urlparse
+    p = str(raw or '').strip()
+    if len(p) >= 2 and p[0] == p[-1] and p[0] in '"\'':
+        p = p[1:-1].strip()
+    if p.startswith('file://'):
+        p = unquote(urlparse(p).path)
+    if not os.path.exists(p):
+        p = re.sub(r'\\(.)', r'\1', p)  # undo shell escaping from drag-and-drop into Terminal
+    return os.path.expanduser(p)
+
+
+def _path_not_found_message(path):
+    msg = f'File not found: {path}'
+    base = os.path.basename(path)
+    hints = []
+    if base:
+        search_roots = [os.path.dirname(path), os.path.expanduser('~/Downloads'), os.path.expanduser('~/Desktop')]
+        for root in search_roots:
+            if not root or not os.path.isdir(root):
+                continue
+            for dirpath, dirnames, filenames in os.walk(root):
+                if dirpath.count(os.sep) - root.count(os.sep) >= 2:
+                    dirnames[:] = []
+                if base in filenames:
+                    hints.append(os.path.join(dirpath, base))
+            if hints:
+                break
+    if hints:
+        msg += ' — did you mean: ' + ' or '.join(hints[:3])
+    else:
+        folder = os.path.dirname(path)
+        if folder and os.path.isdir(folder):
+            csvs = sorted(f for f in os.listdir(folder) if f.lower().endswith(('.csv', '.txt', '.zip')))[:8]
+            if csvs:
+                msg += f'. Files in that folder: {", ".join(csvs)}'
+                if any(f.lower().endswith('.zip') for f in csvs):
+                    msg += ' (unzip the .zip first)'
+    return msg
+
+
+def _estimate_records(total_lines, sample_df):
+    """Rows of long text span many lines; estimate records from newlines per sampled record."""
+    if sample_df is None or not len(sample_df):
+        return total_lines, False
+    text = sample_df.select_dtypes(include=['object', 'string'])
+    newlines = sum(int(text[c].dropna().astype(str).str.count('\n').sum()) for c in text.columns)
+    lines_per_record = 1 + newlines / len(sample_df)
+    if lines_per_record <= 1.01:
+        return total_lines, False
+    return max(len(sample_df), int(round(total_lines / lines_per_record))), True
+
+
 # Global variables to store data
 csv_data = None
 file_info = None
 
-def analyze_csv_structure(file_path):
+def analyze_csv_structure(file_path, total_rows=None, sample_df=None):
     """Analyze CSV structure and provide insights about the data"""
     try:
         # Read first few rows to understand structure (for analysis only)
-        sample_df = pd.read_csv(file_path, nrows=1000, low_memory=False)
+        if sample_df is None:
+            sample_df = pd.read_csv(file_path, nrows=1000, low_memory=False)
         
         analysis = {
             'total_rows': 0,
             'columns': list(sample_df.columns),
             'column_types': {},
-            'sample_data': sample_df.head(5).to_dict('records'),
+            'sample_data': _preview_records(sample_df.head(5)),
             'missing_values': {},
             'unique_values': {},
             'data_insights': []
@@ -74,18 +143,21 @@ def analyze_csv_structure(file_path):
             
             # Get unique values (limit to 20 for performance)
             unique_vals = sample_df[col].dropna().unique()
-            analysis['unique_values'][col] = unique_vals[:20].tolist()
+            analysis['unique_values'][col] = [_preview_value(v) for v in unique_vals[:20].tolist()]
             
             # Generate insights based on column name and content
             insights = generate_column_insights(col, sample_df[col])
             analysis['data_insights'].extend(insights)
         
         # Get total row count efficiently
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                analysis['total_rows'] = sum(1 for line in f) - 1  # Subtract header
-        except:
-            analysis['total_rows'] = len(sample_df)
+        if total_rows is not None:
+            analysis['total_rows'] = total_rows
+        else:
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                    analysis['total_rows'] = sum(1 for line in f) - 1  # Subtract header
+            except Exception:
+                analysis['total_rows'] = len(sample_df)
         
         return analysis
         
@@ -158,6 +230,14 @@ def filter_data(filters, page=1, page_size=100):
         collected = []
         collected_count = 0
         total_matches = 0
+
+        no_filters = not any(v for k, v in (filters or {}).items() if v not in ('', 'all', None))
+        path = (file_info or {}).get('full_file_path')
+        if no_filters and path and os.path.exists(path):
+            # Nothing filtered: read just the rows for this page instead of scanning a multi-GB file
+            head = pd.read_csv(path, nrows=skip + page_size, low_memory=False)
+            total = int(file_info.get('exact_rows') or file_info.get('total_rows') or len(head))
+            return head.iloc[skip:skip + page_size].reset_index(drop=True), max(total, len(head))
 
         if file_info and file_info.get('full_file_path') and os.path.exists(file_info['full_file_path']):
             source = pd.read_csv(file_info['full_file_path'], chunksize=10000, low_memory=False)
@@ -238,20 +318,28 @@ def load_from_path():
     """Load a CSV directly from a local file path — avoids uploading large files."""
     global csv_data, file_info
 
-    data = request.json
-    file_path = (data.get('path') or '').strip()
+    data = request.json or {}
+    raw_path = (data.get('path') or '').strip()
+    file_path = _resolve_user_path(raw_path)
 
-    if not file_path:
+    if not raw_path:
         return jsonify({'error': 'File path is required'}), 400
+    if os.path.isdir(file_path):
+        csvs = sorted(f for f in os.listdir(file_path) if f.lower().endswith('.csv'))[:8]
+        hint = f' CSV files in it: {", ".join(csvs)}' if csvs else ''
+        return jsonify({'error': f'That is a folder, not a file: {file_path}.{hint}'}), 400
     if not os.path.exists(file_path):
-        return jsonify({'error': f'File not found: {file_path}'}), 400
+        return jsonify({'error': _path_not_found_message(file_path)}), 400
+    if file_path.lower().endswith('.zip'):
+        return jsonify({'error': 'That is a .zip file. Unzip it first (double-click it in Finder), then load the .csv inside.'}), 400
 
     try:
         sample_df = pd.read_csv(file_path, nrows=1000, low_memory=False)
 
-        # Count rows without loading the full file
-        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            total_rows = sum(1 for _ in f) - 1
+        # Count lines without loading the full file; filings span many lines, so estimate records
+        with open(file_path, 'rb') as f:
+            total_lines = sum(1 for _ in f) - 1
+        total_rows, rows_approximate = _estimate_records(total_lines, sample_df)
 
         csv_data = sample_df
         file_info = {
@@ -259,17 +347,19 @@ def load_from_path():
             'full_file_path': file_path,
             'is_path_loaded': True,
             'total_rows': total_rows,
+            'rows_approximate': rows_approximate,
             'upload_time': datetime.now().isoformat(),
             'file_size': os.path.getsize(file_path),
         }
 
-        analysis = analyze_csv_structure(file_path)
+        analysis = analyze_csv_structure(file_path, total_rows=total_rows, sample_df=sample_df)
 
         return jsonify({
             'success': True,
             'total_rows': total_rows,
             'columns': list(sample_df.columns),
-            'sample_data': sample_df.head(20).replace({np.nan: None}).to_dict('records'),
+            'rows_approximate': rows_approximate,
+            'sample_data': _preview_records(sample_df.head(20)),
             'file_info': file_info,
             'analysis': analysis,
         })
@@ -534,12 +624,13 @@ def run_snippet_search(terms, n_words, filters):
 
     sic_test = _parse_sic_filter(filters.get('sic'))
     other_filters = {k: v for k, v in filters.items() if k != 'sic'}
-    results, text_cols, meta_cols, sic_source = [], None, None, []
+    results, text_cols, meta_cols, sic_source, records_seen = [], None, None, [], 0
     for chunk in source:
         if text_cols is None:
             text_cols = _detect_text_columns(chunk) or list(chunk.select_dtypes(include=['object', 'string']).columns)
             meta_cols = [c for c in chunk.columns if c not in text_cols]
             sic_source = _sic_source_column(chunk.columns)
+        records_seen += len(chunk)
         chunk = _apply_filters_to_chunk(chunk, {k: v for k, v in _normalize_filters(other_filters, chunk.columns).items() if k != 'search'})
         sics = _sic_for_chunk(chunk, sic_source)
         for (idx, row), (sic, sic_desc) in zip(chunk.iterrows(), sics):
@@ -553,7 +644,9 @@ def run_snippet_search(terms, n_words, filters):
                                 '_hits': len(hits), '_snippet': snippet})
                     results.append(rec)
 
-    info = {'meta_columns': meta_cols or [],
+    if file_info is not None and source_path:
+        file_info['exact_rows'] = records_seen
+    info = {'meta_columns': meta_cols or [], 'total_records': records_seen,
             'sic_source': '+'.join(k for k, _ in sic_source) or None,
             'sic_source_column': ', '.join(str(c) for _, c in sic_source) or None}
     _snippet_cache.update(key=key, results=results, meta_columns=info)
@@ -583,6 +676,7 @@ def snippets_endpoint():
             'snippets': results[start:start + page_size],
             'total_snippets': len(results),
             'total_documents': len({r['_row'] for r in results}),
+            'records_scanned': info.get('total_records'),
             'total_pages': max(1, -(-len(results) // page_size)),
             'page': page,
             'meta_columns': info['meta_columns'],
@@ -708,7 +802,7 @@ def filter_data_endpoint():
             return jsonify({'error': 'No data available'}), 400
 
         result = {
-            'filtered_data': page_df.replace({np.nan: None}).to_dict('records'),
+            'filtered_data': _preview_records(page_df),
             'total_filtered_rows': total_matches,
             'page': page,
             'page_size': page_size,
@@ -724,29 +818,24 @@ def filter_data_endpoint():
 
 @app.route('/api/export', methods=['POST'])
 def export_data():
-    """Export filtered data as CSV"""
+    """Export every row matching the filters (full text, not previews) as CSV, streamed to a temp file."""
     try:
-        filters = request.json.get('filters', {})
-        
-        filtered_df = filter_data(filters)
-        if filtered_df is None:
+        filters = (request.json or {}).get('filters', {}) or {}
+        if csv_data is None:
             return jsonify({'error': 'No data available'}), 400
-        
-        # Create CSV in memory
-        output = io.StringIO()
-        filtered_df.to_csv(output, index=False)
-        output.seek(0)
-        
-        # Create file response
-        filename = f"filtered_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        
-        return send_file(
-            io.BytesIO(output.getvalue().encode('utf-8')),
-            mimetype='text/csv',
-            as_attachment=True,
-            download_name=filename
-        )
-        
+        path = (file_info or {}).get('full_file_path')
+        source = pd.read_csv(path, chunksize=5000, low_memory=False) if path and os.path.exists(path) else [csv_data.copy()]
+        out = tempfile.NamedTemporaryFile(prefix='export_', suffix='.csv', delete=False)
+        out.close()
+        wrote_header = False
+        for chunk in source:
+            chunk = _apply_filters_to_chunk(chunk, _normalize_filters(filters, chunk.columns))
+            if len(chunk) or not wrote_header:
+                chunk.to_csv(out.name, mode='a', index=False, header=not wrote_header)
+                wrote_header = True
+        base = os.path.splitext((file_info or {}).get('filename') or 'data')[0]
+        filename = f"{base}_filtered_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        return send_file(out.name, mimetype='text/csv', as_attachment=True, download_name=filename)
     except Exception as e:
         logger.error(f"Export error: {str(e)}")
         return jsonify({'error': f'Export failed: {str(e)}'}), 500
@@ -863,7 +952,7 @@ def search_full_file():
             'limited': limited,
             'total_file_rows': total_rows,
             'searched_full_file': file_info.get('is_sampled', False),
-            'search_results': matching_rows.to_dict('records'),
+            'search_results': _preview_records(matching_rows),
             'columns': list(search_data.columns)
         }
         

@@ -46,7 +46,7 @@ const FileUpload = ({ onAnalysisStart, onAnalysisComplete, onFileRead, isAnalyzi
         throw new Error(`Backend returned an invalid response (HTTP ${res.status}): ${text.slice(0, 200)}`);
       }
       if (!res.ok) throw new Error(result.error || `Backend error (HTTP ${res.status})`);
-      setUploadStatus(`Loaded ${result.total_rows.toLocaleString()} rows — displaying first 20, backend handles filtering`);
+      setUploadStatus(`Loaded ${result.rows_approximate ? '≈' : ''}${result.total_rows.toLocaleString()} rows — long text is shortened in the table; use Keyword Snippets to search it`);
 
       const analysis = {
         totalCustomers: result.total_rows,

@@ -150,7 +150,36 @@ const DataViewer = ({ csvData, fileName, backendMode = false, totalRows }) => {
     }
   };
 
+  const [exporting, setExporting] = useState(false);
+
+  const exportFromBackend = async () => {
+    setExporting(true);
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filters }),
+      });
+      if (!res.ok) throw new Error(`Export failed (HTTP ${res.status})`);
+      const blob = await res.blob();
+      const match = (res.headers.get('Content-Disposition') || '').match(/filename="?([^";]+)"?/);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = match ? match[1] : `${fileName.replace('.csv', '')}_filtered.csv`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setExporting(false);
+    }
+  };
+
   const exportData = () => {
+    if (backendMode) { exportFromBackend(); return; }
     if (!filteredData || filteredData.length === 0) { alert('No data to export'); return; }
     const headers = Object.keys(filteredData[0]);
     const csvRows = [headers.join(',')];
@@ -212,9 +241,9 @@ const DataViewer = ({ csvData, fileName, backendMode = false, totalRows }) => {
             Columns: {columns.length}
           </div>
         </div>
-        <button className="btn btn-success" onClick={exportData}>
+        <button className="btn btn-success" onClick={exportData} disabled={exporting}>
           <Download size={16} />
-          Export Filtered Data
+          {exporting ? 'Exporting all matching rows…' : 'Export Filtered Data'}
         </button>
       </div>
 
