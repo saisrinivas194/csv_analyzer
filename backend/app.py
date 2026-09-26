@@ -310,13 +310,19 @@ def _term_regex(terms):
     return re.compile(r'(?<![A-Za-z0-9])(?:' + '|'.join(parts) + r')(?:s|es)?(?![A-Za-z0-9])', re.IGNORECASE)
 
 
+PREFERRED_TEXT_COLUMNS = ('raw_text', 'full_text', 'filing_text', 'document_text', 'text', 'content', 'body')
+
+
 def _detect_text_columns(df):
     text_cols = []
     for col in df.select_dtypes(include=['object', 'string']).columns:
         lengths = df[col].dropna().astype(str).str.len()
         if len(lengths) and lengths.mean() > LONG_TEXT_AVG_CHARS:
             text_cols.append(col)
-    return text_cols
+    # If the file has a column that is clearly the full document (e.g. raw_text), search only that,
+    # so summaries such as an LLM-written 'excerpt' or 'title' don't produce duplicate hits.
+    preferred = [c for c in text_cols if str(c).lower() in PREFERRED_TEXT_COLUMNS]
+    return preferred or text_cols
 
 
 def _word_window_start(text, pos, n_words):
@@ -411,11 +417,13 @@ def _load_sic_lookup():
     global _sic_lookup
     if _sic_lookup is not None:
         return _sic_lookup
-    by_cik, by_name, codes = {}, {}, []
+    by_cik, by_name, by_ticker, codes = {}, {}, {}, []
     if os.path.exists(_SIC_PATH):
         df = pd.read_csv(_SIC_PATH, dtype=str, keep_default_na=False)
-        for cik, sic, desc, name in zip(df['cik'], df['sic'], df['sic_description'], df['name']):
+        for cik, sic, desc, name, tickers in zip(df['cik'], df['sic'], df['sic_description'], df['name'], df['tickers']):
             by_cik[int(cik)] = (sic, desc)
+            for t in filter(None, str(tickers).upper().split('|')):
+                by_ticker[t] = (sic, desc) if by_ticker.get(t, (sic, desc)) == (sic, desc) else None
             key = _norm_company_name(name)
             if key:
                 # a name shared by companies in different industries is ambiguous -> no match
@@ -424,7 +432,7 @@ def _load_sic_lookup():
         codes = grouped.sort_values('sic').to_dict('records')
     else:
         logger.warning(f"SIC lookup not found at {_SIC_PATH}; industry filter disabled")
-    _sic_lookup = {'by_cik': by_cik, 'by_name': by_name, 'codes': codes}
+    _sic_lookup = {'by_cik': by_cik, 'by_name': by_name, 'by_ticker': by_ticker, 'codes': codes}
     return _sic_lookup
 
 
@@ -434,37 +442,56 @@ def _to_cik(value):
 
 
 def _sic_source_column(columns):
-    """Pick how to assign SIC codes to rows: the file's own SIC column, else CIK, else company name."""
+    """How to assign SIC codes to rows, as an ordered list of (kind, column) strategies:
+    the file's own SIC column, else CIK, else ticker then company name (first match per row wins)."""
     lower = {str(c).lower(): c for c in columns}
     for name in ('sic', 'sic_code', 'siccode', 'sic code'):
         if name in lower:
-            return 'sic', lower[name]
+            return [('sic', lower[name])]
     for c in columns:
         if 'cik' in str(c).lower():
-            return 'cik', c
+            return [('cik', c)]
+    strategies = []
+    for name in ('symbol', 'ticker', 'tickers', 'trading_symbol'):
+        if name in lower:
+            strategies.append(('ticker', lower[name]))
+            break
     for kw in ('company', 'registrant', 'entity'):
-        for c in columns:
-            if kw in str(c).lower() and 'id' not in str(c).lower():
-                return 'name', c
-    return None, None
+        col = next((c for c in columns if kw in str(c).lower() and 'id' not in str(c).lower()), None)
+        if col is not None:
+            strategies.append(('name', col))
+            break
+    return strategies
 
 
-def _sic_for_chunk(chunk, source):
+def _sic_for_chunk(chunk, strategies):
     """Return a list of (sic, description) per row (('', '') when unknown)."""
-    kind, col = source
     lk = _load_sic_lookup()
     code_desc = {c['sic']: c['description'] for c in lk['codes']}
-    out = []
-    for v in (chunk[col] if col is not None else [None] * len(chunk)):
-        hit = None
-        if kind == 'sic' and v is not None and str(v).strip() not in ('', 'nan'):
+
+    def lookup(kind, v):
+        if v is None or (isinstance(v, float) and np.isnan(v)) or str(v).strip() in ('', 'nan', '<NA>'):
+            return None
+        if kind == 'sic':
             code = str(v).split('.')[0].strip().zfill(4)
-            hit = (code, code_desc.get(code, ''))
-        elif kind == 'cik':
+            return (code, code_desc.get(code, ''))
+        if kind == 'cik':
             cik = _to_cik(v)
-            hit = lk['by_cik'].get(cik) if cik is not None else None
-        elif kind == 'name' and v is not None:
-            hit = lk['by_name'].get(_norm_company_name(v))
+            return lk['by_cik'].get(cik) if cik is not None else None
+        if kind == 'ticker':
+            return lk['by_ticker'].get(str(v).strip().upper())
+        if kind == 'name':
+            return lk['by_name'].get(_norm_company_name(v))
+        return None
+
+    columns = [chunk[col].tolist() for _, col in strategies]
+    out = []
+    for i in range(len(chunk)):
+        hit = None
+        for (kind, _), values in zip(strategies, columns):
+            hit = lookup(kind, values[i])
+            if hit:
+                break
         out.append(hit or ('', ''))
     return out
 
@@ -507,7 +534,7 @@ def run_snippet_search(terms, n_words, filters):
 
     sic_test = _parse_sic_filter(filters.get('sic'))
     other_filters = {k: v for k, v in filters.items() if k != 'sic'}
-    results, text_cols, meta_cols, sic_source = [], None, None, (None, None)
+    results, text_cols, meta_cols, sic_source = [], None, None, []
     for chunk in source:
         if text_cols is None:
             text_cols = _detect_text_columns(chunk) or list(chunk.select_dtypes(include=['object', 'string']).columns)
@@ -526,7 +553,9 @@ def run_snippet_search(terms, n_words, filters):
                                 '_hits': len(hits), '_snippet': snippet})
                     results.append(rec)
 
-    info = {'meta_columns': meta_cols or [], 'sic_source': sic_source[0], 'sic_source_column': sic_source[1]}
+    info = {'meta_columns': meta_cols or [],
+            'sic_source': '+'.join(k for k, _ in sic_source) or None,
+            'sic_source_column': ', '.join(str(c) for _, c in sic_source) or None}
     _snippet_cache.update(key=key, results=results, meta_columns=info)
     return results, info
 
