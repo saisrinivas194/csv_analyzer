@@ -34,14 +34,27 @@ const Highlighted = ({ text, regex }) => {
   );
 };
 
+// Summary-style columns (often LLM-generated in public datasets) and IDs already covered by the EDGAR link
+const HIDDEN_META = /^(title|keywords?|excerpt|summary|description|abstract)$|accession/i;
+const MAX_META_CHARS = 60;
+
+const formatMetaValue = (col, v) => {
+  const str = String(v);
+  if (/date|time/i.test(col) && /^\d{4}-\d{2}-\d{2}/.test(str)) return str.slice(0, 10);
+  return str;
+};
+
 const pickMeta = (row, metaColumns) => {
   const find = (keys) => metaColumns.find(c => keys.some(k => c.toLowerCase().includes(k)));
   const company = find(['company', 'registrant', 'entity', 'name']);
   const form = find(['form', 'filing_type', 'type']);
   const date = find(['date', 'period', 'year']);
   const used = new Set([company, form, date].filter(Boolean));
-  const primary = [company, form, date].filter(Boolean).map(c => row[c]).filter(v => v !== null && v !== undefined && v !== '');
-  const extra = metaColumns.filter(c => !used.has(c)).map(c => `${c}: ${row[c] ?? ''}`);
+  const present = (v) => v !== null && v !== undefined && v !== '';
+  const primary = [company, form, date].filter(Boolean).filter(c => present(row[c])).map(c => formatMetaValue(c, row[c]));
+  const extra = metaColumns
+    .filter(c => !used.has(c) && !HIDDEN_META.test(c) && present(row[c]) && String(row[c]).length <= MAX_META_CHARS)
+    .map(c => `${c}: ${formatMetaValue(c, row[c])}`);
   return { primary, extra };
 };
 
@@ -278,8 +291,17 @@ const SnippetSearch = ({ backendMode }) => {
                     row {s._row} · column {s._column} · {s._matched}{s._hits > 1 ? ` (${s._hits} hits)` : ''}
                   </span>
                 </div>
-                {extra.length > 0 && (
-                  <div style={{ fontSize: '0.75rem', color: '#6b7280', marginBottom: '6px' }}>{extra.join(' · ')}</div>
+                {(extra.length > 0 || s._edgar_url) && (
+                  <div style={{ fontSize: '0.75rem', color: '#6b7280', marginBottom: '6px', display: 'flex', gap: '10px', flexWrap: 'wrap', alignItems: 'center' }}>
+                    {extra.length > 0 && <span>{extra.join(' · ')}</span>}
+                    {s._edgar_url && (
+                      <a href={s._edgar_url} target="_blank" rel="noopener noreferrer"
+                        style={{ color: '#2563eb', fontWeight: 600, textDecoration: 'none' }}
+                        title="Open the original filing on sec.gov to see the formatted tables">
+                        View filing on EDGAR ↗
+                      </a>
+                    )}
+                  </div>
                 )}
                 <div style={{ fontSize: '0.9rem', lineHeight: 1.55, color: '#1f2937' }}>
                   <Highlighted text={s._snippet} regex={highlightRegex} />
