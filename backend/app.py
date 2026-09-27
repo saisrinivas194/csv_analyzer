@@ -511,13 +511,14 @@ def _load_sic_lookup():
     if os.path.exists(_SIC_PATH):
         df = pd.read_csv(_SIC_PATH, dtype=str, keep_default_na=False)
         for cik, sic, desc, name, tickers in zip(df['cik'], df['sic'], df['sic_description'], df['name'], df['tickers']):
-            by_cik[int(cik)] = (sic, desc)
+            entry = (sic, desc, str(int(cik)))
+            by_cik[int(cik)] = entry
             for t in filter(None, str(tickers).upper().split('|')):
-                by_ticker[t] = (sic, desc) if by_ticker.get(t, (sic, desc)) == (sic, desc) else None
+                by_ticker[t] = entry if by_ticker.get(t, entry) == entry else None
             key = _norm_company_name(name)
             if key:
                 # a name shared by companies in different industries is ambiguous -> no match
-                by_name[key] = (sic, desc) if by_name.get(key, (sic, desc)) == (sic, desc) else None
+                by_name[key] = entry if by_name.get(key, entry) == entry else None
         grouped = df.groupby('sic').agg(description=('sic_description', 'first'), companies=('cik', 'size')).reset_index()
         codes = grouped.sort_values('sic').to_dict('records')
     else:
@@ -555,7 +556,7 @@ def _sic_source_column(columns):
 
 
 def _sic_for_chunk(chunk, strategies):
-    """Return a list of (sic, description) per row (('', '') when unknown)."""
+    """Return a list of (sic, description, cik) per row (empty strings when unknown)."""
     lk = _load_sic_lookup()
     code_desc = {c['sic']: c['description'] for c in lk['codes']}
 
@@ -564,10 +565,12 @@ def _sic_for_chunk(chunk, strategies):
             return None
         if kind == 'sic':
             code = str(v).split('.')[0].strip().zfill(4)
-            return (code, code_desc.get(code, ''))
+            return (code, code_desc.get(code, ''), '')
         if kind == 'cik':
             cik = _to_cik(v)
-            return lk['by_cik'].get(cik) if cik is not None else None
+            if cik is None:
+                return None
+            return lk['by_cik'].get(cik) or ('', '', str(cik))  # keep the CIK for EDGAR links even without a SIC
         if kind == 'ticker':
             return lk['by_ticker'].get(str(v).strip().upper())
         if kind == 'name':
@@ -582,8 +585,20 @@ def _sic_for_chunk(chunk, strategies):
             hit = lookup(kind, values[i])
             if hit:
                 break
-        out.append(hit or ('', ''))
+        out.append(hit or ('', '', ''))
     return out
+
+
+def _edgar_filing_url(accession, cik=''):
+    """Link to the filing's index page on sec.gov (formatted tables, exhibits).
+    Uses the company's CIK when known, else the CIK embedded in the accession number (works for filing agents too)."""
+    acc = re.sub(r'[^0-9-]', '', str(accession or ''))
+    digits = acc.replace('-', '')
+    if len(digits) != 18:
+        return ''
+    acc = f"{digits[:10]}-{digits[10:12]}-{digits[12:]}"
+    folder_cik = str(int(cik)) if str(cik or '').isdigit() else str(int(digits[:10]))
+    return f"https://www.sec.gov/Archives/edgar/data/{folder_cik}/{digits}/{acc}-index.htm"
 
 
 def _parse_sic_filter(raw):
@@ -624,22 +639,25 @@ def run_snippet_search(terms, n_words, filters):
 
     sic_test = _parse_sic_filter(filters.get('sic'))
     other_filters = {k: v for k, v in filters.items() if k != 'sic'}
-    results, text_cols, meta_cols, sic_source, records_seen = [], None, None, [], 0
+    results, text_cols, meta_cols, sic_source, records_seen, accession_col = [], None, None, [], 0, None
     for chunk in source:
         if text_cols is None:
             text_cols = _detect_text_columns(chunk) or list(chunk.select_dtypes(include=['object', 'string']).columns)
             meta_cols = [c for c in chunk.columns if c not in text_cols]
             sic_source = _sic_source_column(chunk.columns)
+            accession_col = next((c for c in chunk.columns if 'accession' in str(c).lower()), None)
         records_seen += len(chunk)
         chunk = _apply_filters_to_chunk(chunk, {k: v for k, v in _normalize_filters(other_filters, chunk.columns).items() if k != 'search'})
         sics = _sic_for_chunk(chunk, sic_source)
-        for (idx, row), (sic, sic_desc) in zip(chunk.iterrows(), sics):
+        for (idx, row), (sic, sic_desc, cik) in zip(chunk.iterrows(), sics):
             if sic_test and not sic_test(sic):
                 continue
             for col in text_cols:
                 for snippet, hits in extract_snippets(row.get(col), pattern, n_words):
                     rec = {c: row[c] for c in meta_cols}
+                    edgar = _edgar_filing_url(row[accession_col], cik) if accession_col is not None else ''
                     rec.update({'_row': int(idx) + 1, '_column': col, '_sic': sic, '_sic_description': sic_desc,
+                                '_cik': cik, '_edgar_url': edgar,
                                 '_matched': ', '.join(sorted({h.lower() for h in hits})),
                                 '_hits': len(hits), '_snippet': snippet})
                     results.append(rec)
@@ -701,8 +719,8 @@ def snippets_export():
     try:
         results, info = run_snippet_search(terms, n_words, filters)
         meta_cols = info['meta_columns']
-        df = pd.DataFrame(results, columns=meta_cols + ['_sic', '_sic_description', '_row', '_column', '_matched', '_hits', '_snippet'])
-        df = df.rename(columns={'_sic': 'sec_sic_code', '_sic_description': 'sec_sic_description',
+        df = pd.DataFrame(results, columns=meta_cols + ['_cik', '_sic', '_sic_description', '_edgar_url', '_row', '_column', '_matched', '_hits', '_snippet'])
+        df = df.rename(columns={'_cik': 'sec_cik', '_sic': 'sec_sic_code', '_sic_description': 'sec_sic_description', '_edgar_url': 'edgar_filing_url',
                                 '_row': 'source_row', '_column': 'text_column', '_matched': 'matched_terms',
                                 '_hits': 'hits_in_snippet', '_snippet': f'snippet_{n_words}_words_each_side'})
         output = io.StringIO()
