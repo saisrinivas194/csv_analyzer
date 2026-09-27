@@ -255,9 +255,10 @@ const SnippetSearch = ({ backendMode }) => {
           This file has no CIK or company-name column, so SEC industry codes can't be matched{activeQuery?.sic ? ' and the SIC filter excluded every row' : ''}.
         </div>
       )}
-      {result && result.sic_source === 'name' && (
+      {result && result.sic_source && /ticker|name/.test(result.sic_source) && (
         <div style={{ fontSize: '0.8rem', color: '#6b7280', margin: '8px 0' }}>
-          SIC codes matched by company name (column “{result.sic_source_column}”) because the file has no CIK column. A CIK column gives exact matches.
+          SIC codes matched by {result.sic_source.replace('+', ', then ')} (columns: {result.sic_source_column}) because the file has no CIK column.
+          {result.snippets_without_sic > 0 && ` ${result.snippets_without_sic.toLocaleString()} snippet${result.snippets_without_sic === 1 ? '' : 's'} had no match.`}
         </div>
       )}
       {result && result.total_snippets === 0 && (

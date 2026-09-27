@@ -70,17 +70,21 @@ Filing text columns can hold an entire 10-K per cell, so a normal search returns
 - Optionally narrow by company or form type (10-K, 8-K, 6-K…)
 - Matching is case-insensitive, whole-word (`ARPU` does not match `SARPU`), tolerates line breaks inside phrases, and includes simple plurals (`ARPUs`)
 - Hits that are close together are merged into one snippet, so numbers next to each other aren't split
-- Long text columns (e.g. `section_7`, `text`) are detected automatically; every other column is kept as metadata
+- Long text columns (e.g. `section_7`, `text`) are detected automatically; every other column is kept as metadata. If one of them is clearly the full document (`raw_text`, `text`, `full_text`…), only that column is searched, so summary columns don't produce duplicate hits
 - **Export Snippets CSV** downloads every snippet with its metadata, source row and text column
 
 The first search streams the whole file; paging and export of the same query reuse the cached result.
+
+### Works with the Kaggle 8-K 2024 dataset
+
+[SEC 8k Raw Text Filings 2024](https://www.kaggle.com/datasets/datavadar/sec-8k-raw-text-filings-2024) (`8k_filings_raw_text_2024.csv`, ~58k filings, 3.5 GB, CC0). Its `title`, `keywords` and `excerpt` columns are LLM-generated, so snippet search reads only `raw_text`; SIC codes are matched via `symbol`, then `company_name`.
 
 ### Industry filter (SEC SIC codes)
 
 Each snippet is tagged with the company's SEC Standard Industrial Classification code, and you can restrict a search to industries:
 
 - Enter codes or prefixes, comma-separated: `7370-7379` (software & internet), `48` (communications), `4841, 7841` (cable & streaming). Plain entries match as prefixes, so `737` covers 7370–7379.
-- Codes come from `backend/data/sec_sic_lookup.csv` (67,717 SEC filers, pulled from EDGAR on 2026-09-26) and are matched on the file's **CIK** column. If the file has no CIK column, they're matched by normalized company name; if it already has a `sic` column, that is used as-is.
+- Codes come from `backend/data/sec_sic_lookup.csv` (67,717 SEC filers, pulled from EDGAR on 2026-09-26) and are matched on the file's **CIK** column. With no CIK column they're matched by **ticker** (`symbol`/`ticker` column), then by normalized company name; if the file already has a `sic` column, that is used as-is.
 - SIC codes are the SEC's current assignment and can be dated (Netflix is still 7841 "Video Tape Rental"), so check company lists, not just codes.
 - Refresh the lookup any time: `cd backend && python refresh_sic.py "Your Name you@email.com"` (downloads ~1.5 GB from the SEC).
 

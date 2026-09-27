@@ -3,6 +3,7 @@ import { Upload, FileText, AlertCircle, CheckCircle, FolderOpen } from 'lucide-r
 import FastFileLoader from '../utils/FastFileLoader.js';
 
 const BACKEND_URL = 'http://localhost:5001';
+const BROWSER_MAX_BYTES = 200 * 1024 * 1024; // larger files must use Load from Path
 
 const FileUpload = ({ onAnalysisStart, onAnalysisComplete, onFileRead, isAnalyzing }) => {
   const [selectedFile, setSelectedFile] = useState(null);
@@ -16,6 +17,15 @@ const FileUpload = ({ onAnalysisStart, onAnalysisComplete, onFileRead, isAnalyzi
     if (!file) { setSelectedFile(null); setUploadStatus(''); return; }
     const validExtensions = ['.csv', '.txt'];
     const ext = file.name.toLowerCase().substring(file.name.lastIndexOf('.'));
+    if (validExtensions.includes(ext) && file.size > BROWSER_MAX_BYTES) {
+      // Big files crash the browser tab (everything is held in memory). Send them to the backend instead.
+      setSelectedFile(null);
+      setMode('path');
+      setFilePath(`~/Downloads/${file.name}`);
+      setUploadStatus(`${file.name} is ${(file.size / (1024 * 1024)).toFixed(0)} MB, too big to open in the browser, so this switched to Load from Path. Click Load; if the file isn't in Downloads, the error will say where it was found (or paste its path: Finder → right-click → hold Option → Copy as Pathname).`);
+      event.target.value = '';
+      return;
+    }
     if (validExtensions.includes(ext)) {
       setSelectedFile(file);
       setUploadStatus(`File selected: ${file.name} (${(file.size / (1024 * 1024)).toFixed(2)} MB)`);
@@ -46,7 +56,7 @@ const FileUpload = ({ onAnalysisStart, onAnalysisComplete, onFileRead, isAnalyzi
         throw new Error(`Backend returned an invalid response (HTTP ${res.status}): ${text.slice(0, 200)}`);
       }
       if (!res.ok) throw new Error(result.error || `Backend error (HTTP ${res.status})`);
-      setUploadStatus(`Loaded ${result.total_rows.toLocaleString()} rows — displaying first 20, backend handles filtering`);
+      setUploadStatus(`Loaded ${result.rows_approximate ? '≈' : ''}${result.total_rows.toLocaleString()} rows — long text is shortened in the table; use Keyword Snippets to search it`);
 
       const analysis = {
         totalCustomers: result.total_rows,
@@ -139,7 +149,7 @@ const FileUpload = ({ onAnalysisStart, onAnalysisComplete, onFileRead, isAnalyzi
           disabled={isAnalyzing}
         >
           <Upload size={16} style={{ marginRight: 6 }} />
-          Upload in Browser (small files)
+          Upload in Browser (under 200 MB)
         </button>
       </div>
 
