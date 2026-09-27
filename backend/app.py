@@ -45,7 +45,7 @@ class SafeJSONProvider(DefaultJSONProvider):
 
 app = Flask(__name__)
 app.json = SafeJSONProvider(app)
-CORS(app)
+CORS(app, expose_headers=['Content-Disposition'])
 
 # Global variables to store data
 csv_data = None
@@ -117,7 +117,7 @@ def generate_column_insights(column_name, series):
         insights.append(f"Numeric data: {column_name} is numeric with range {series.min()} to {series.max()}")
     
     # Categorical insights
-    if series.dtype == 'object' and series.nunique() < 50:
+    if (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)) and series.nunique() < 50:
         top_values = series.value_counts().head(3)
         insights.append(f"Top values: {column_name} top values: {', '.join([f'{k}({v})' for k, v in top_values.items()])}")
     
@@ -127,7 +127,7 @@ def _apply_filters_to_chunk(chunk, filters):
     """Apply filters to a dataframe chunk. Returns filtered chunk."""
     search_term = filters.get('search', '').lower()
     if search_term:
-        text_cols = chunk.select_dtypes(include=['object']).columns
+        text_cols = chunk.select_dtypes(include=['object', 'string']).columns
         mask = pd.Series([False] * len(chunk), index=chunk.index)
         for col in text_cols:
             mask |= chunk[col].astype(str).str.lower().str.contains(search_term, na=False)
@@ -137,7 +137,7 @@ def _apply_filters_to_chunk(chunk, filters):
         if column == 'search' or not value or value == 'all':
             continue
         if column in chunk.columns:
-            if chunk[column].dtype == 'object':
+            if (pd.api.types.is_object_dtype(chunk[column]) or pd.api.types.is_string_dtype(chunk[column])):
                 chunk = chunk[chunk[column].astype(str).str.contains(str(value), case=False, na=False)]
             else:
                 chunk = chunk[chunk[column] == value]
@@ -166,7 +166,7 @@ def filter_data(filters, page=1, page_size=100):
             source = [csv_data.copy()]
 
         for chunk in source:
-            filtered_chunk = _apply_filters_to_chunk(chunk, filters)
+            filtered_chunk = _apply_filters_to_chunk(chunk, _normalize_filters(filters, chunk.columns))
             chunk_len = len(filtered_chunk)
             total_matches += chunk_len
 
@@ -277,6 +277,205 @@ def load_from_path():
     except Exception as e:
         logger.error(f"load_path error: {str(e)}")
         return jsonify({'error': f'Failed to load file: {str(e)}'}), 500
+
+
+# ---------------------------------------------------------------------------
+# Keyword-in-context snippets: return N words before/after each term hit
+# instead of whole documents (filing text cells can be hundreds of KB each).
+# ---------------------------------------------------------------------------
+_WORD_RE = re.compile(r'\S+')
+_snippet_cache = {'key': None, 'results': None, 'meta_columns': None}
+LONG_TEXT_AVG_CHARS = 300  # object columns averaging more than this are treated as document text
+
+
+def _parse_terms(raw):
+    if isinstance(raw, list):
+        terms = raw
+    else:
+        terms = re.split(r'[,\n;]', str(raw or ''))
+    seen, out = set(), []
+    for t in (t.strip() for t in terms):
+        if t and t.lower() not in seen:
+            seen.add(t.lower())
+            out.append(t)
+    return out
+
+
+def _term_regex(terms):
+    """Case-insensitive, whole-word match; tolerant of line breaks between words and simple plurals."""
+    parts = []
+    for t in sorted(terms, key=len, reverse=True):
+        words = [re.escape(w) for w in t.split()]
+        parts.append(r'\s+'.join(words))
+    return re.compile(r'(?<![A-Za-z0-9])(?:' + '|'.join(parts) + r')(?:s|es)?(?![A-Za-z0-9])', re.IGNORECASE)
+
+
+def _detect_text_columns(df):
+    text_cols = []
+    for col in df.select_dtypes(include=['object', 'string']).columns:
+        lengths = df[col].dropna().astype(str).str.len()
+        if len(lengths) and lengths.mean() > LONG_TEXT_AVG_CHARS:
+            text_cols.append(col)
+    return text_cols
+
+
+def _word_window_start(text, pos, n_words):
+    """Char offset where the n_words words before pos begin."""
+    lo = max(0, pos - n_words * 40 - 200)
+    starts = [m.start() for m in _WORD_RE.finditer(text, lo, pos)]
+    # If the look-back slice was too short to hold n_words, widen it.
+    while len(starts) < n_words and lo > 0:
+        lo = max(0, lo - n_words * 80)
+        starts = [m.start() for m in _WORD_RE.finditer(text, lo, pos)]
+    return starts[-n_words] if len(starts) >= n_words else (starts[0] if starts else pos)
+
+
+def _word_window_end(text, pos, n_words):
+    """Char offset where the n_words words after pos end."""
+    end = pos
+    for i, m in enumerate(_WORD_RE.finditer(text, pos)):
+        if i >= n_words:
+            break
+        end = m.end()
+    return end
+
+
+def extract_snippets(text, pattern, n_words):
+    """Return [(snippet_text, [matched terms])]; overlapping windows are merged so no hit is lost."""
+    if not isinstance(text, str) or not text:
+        return []
+    windows = []
+    for m in pattern.finditer(text):
+        ws = _word_window_start(text, m.start(), n_words)
+        we = _word_window_end(text, m.end(), n_words)
+        if windows and ws <= windows[-1][1]:
+            windows[-1][1] = max(windows[-1][1], we)
+            windows[-1][2].append(' '.join(m.group(0).split()))
+        else:
+            windows.append([ws, we, [' '.join(m.group(0).split())]])
+    out = []
+    for ws, we, hits in windows:
+        snippet = ' '.join(text[ws:we].split())
+        prefix = '… ' if ws > 0 else ''
+        suffix = ' …' if we < len(text) else ''
+        out.append((prefix + snippet + suffix, hits))
+    return out
+
+
+def _normalize_filters(filters, columns):
+    """Map the UI's generic filter names (company, filingType, exchange, column/value) onto real columns."""
+    def find(keywords):
+        for kw in keywords:
+            for c in columns:
+                if kw in str(c).lower():
+                    return c
+        return None
+    out = {}
+    if filters.get('search'):
+        out['search'] = filters['search']
+    for key, kws in (('company', ['company', 'registrant', 'entity', 'name']),
+                     ('filingType', ['form', 'filing_type', 'type']),
+                     ('exchange', ['exchange', 'market'])):
+        val = filters.get(key)
+        col = find(kws) if val else None
+        if col:
+            out[col] = val
+    col, val = filters.get('column'), filters.get('value')
+    if col and col != 'all' and val and col in columns:
+        out[col] = val
+    for k, v in filters.items():  # already-real column names pass through
+        if k in columns and v:
+            out[k] = v
+    return out
+
+
+def run_snippet_search(terms, n_words, filters):
+    """Stream the whole file and collect every snippet (cached for the last query)."""
+    source_path = file_info.get('full_file_path') if file_info else None
+    key = (source_path, tuple(t.lower() for t in terms), n_words, json.dumps(filters, sort_keys=True))
+    if _snippet_cache['key'] == key:
+        return _snippet_cache['results'], _snippet_cache['meta_columns']
+
+    pattern = _term_regex(terms)
+    if source_path and os.path.exists(source_path):
+        source = pd.read_csv(source_path, chunksize=5000, low_memory=False)
+    else:
+        source = [csv_data.copy()]
+
+    results, text_cols, meta_cols = [], None, None
+    for chunk in source:
+        if text_cols is None:
+            text_cols = _detect_text_columns(chunk) or list(chunk.select_dtypes(include=['object', 'string']).columns)
+            meta_cols = [c for c in chunk.columns if c not in text_cols]
+        chunk = _apply_filters_to_chunk(chunk, {k: v for k, v in _normalize_filters(filters, chunk.columns).items() if k != 'search'})
+        for idx, row in chunk.iterrows():
+            for col in text_cols:
+                for snippet, hits in extract_snippets(row.get(col), pattern, n_words):
+                    rec = {c: row[c] for c in meta_cols}
+                    rec.update({'_row': int(idx) + 1, '_column': col,
+                                '_matched': ', '.join(sorted({h.lower() for h in hits})),
+                                '_hits': len(hits), '_snippet': snippet})
+                    results.append(rec)
+
+    _snippet_cache.update(key=key, results=results, meta_columns=meta_cols or [])
+    return results, meta_cols or []
+
+
+def _snippet_params():
+    body = request.json or {}
+    terms = _parse_terms(body.get('terms'))
+    n_words = max(5, min(int(body.get('window', 50) or 50), 500))
+    return terms, n_words, body.get('filters', {}) or {}, body
+
+
+@app.route('/api/snippets', methods=['POST'])
+def snippets_endpoint():
+    if csv_data is None:
+        return jsonify({'error': 'Load a file first'}), 400
+    terms, n_words, filters, body = _snippet_params()
+    if not terms:
+        return jsonify({'error': 'Enter at least one search term'}), 400
+    try:
+        results, meta_cols = run_snippet_search(terms, n_words, filters)
+        page = max(1, int(body.get('page', 1)))
+        page_size = max(1, min(int(body.get('page_size', 50)), 500))
+        start = (page - 1) * page_size
+        return jsonify({
+            'snippets': results[start:start + page_size],
+            'total_snippets': len(results),
+            'total_documents': len({r['_row'] for r in results}),
+            'total_pages': max(1, -(-len(results) // page_size)),
+            'page': page,
+            'meta_columns': meta_cols,
+            'terms': terms,
+            'window': n_words,
+        })
+    except Exception as e:
+        logger.error(f"Snippet search error: {str(e)}")
+        return jsonify({'error': f'Snippet search failed: {str(e)}'}), 500
+
+
+@app.route('/api/snippets/export', methods=['POST'])
+def snippets_export():
+    if csv_data is None:
+        return jsonify({'error': 'Load a file first'}), 400
+    terms, n_words, filters, _ = _snippet_params()
+    if not terms:
+        return jsonify({'error': 'Enter at least one search term'}), 400
+    try:
+        results, meta_cols = run_snippet_search(terms, n_words, filters)
+        df = pd.DataFrame(results, columns=meta_cols + ['_row', '_column', '_matched', '_hits', '_snippet'])
+        df = df.rename(columns={'_row': 'source_row', '_column': 'text_column', '_matched': 'matched_terms',
+                                '_hits': 'hits_in_snippet', '_snippet': f'snippet_{n_words}_words_each_side'})
+        output = io.StringIO()
+        df.to_csv(output, index=False)
+        slug = '_'.join(re.sub(r'\W+', '', t) for t in terms)[:60]
+        filename = f"snippets_{slug}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        return send_file(io.BytesIO(output.getvalue().encode('utf-8')), mimetype='text/csv',
+                          as_attachment=True, download_name=filename)
+    except Exception as e:
+        logger.error(f"Snippet export error: {str(e)}")
+        return jsonify({'error': f'Export failed: {str(e)}'}), 500
 
 
 @app.route('/api/upload', methods=['POST'])
@@ -441,7 +640,7 @@ def get_insights():
                 })
             
             # Categorical column recommendations
-            elif csv_data[col].dtype == 'object' and csv_data[col].nunique() < 50:
+            elif (pd.api.types.is_object_dtype(csv_data[col]) or pd.api.types.is_string_dtype(csv_data[col])) and csv_data[col].nunique() < 50:
                 insights['recommendations'].append(f"Filter by {col} to focus on specific categories")
                 insights['filter_suggestions'].append({
                     'column': col,
@@ -451,7 +650,7 @@ def get_insights():
                 })
             
             # Text column recommendations
-            elif csv_data[col].dtype == 'object':
+            elif (pd.api.types.is_object_dtype(csv_data[col]) or pd.api.types.is_string_dtype(csv_data[col])):
                 insights['recommendations'].append(f"Search within {col} for specific content")
                 insights['filter_suggestions'].append({
                     'column': col,
@@ -496,7 +695,7 @@ def search_full_file():
             total_rows = len(csv_data)
         
         # Search across all text columns
-        text_columns = search_data.select_dtypes(include=['object']).columns
+        text_columns = search_data.select_dtypes(include=['object', 'string']).columns
         mask = pd.Series([False] * len(search_data))
         
         for col in text_columns:
@@ -559,7 +758,7 @@ def download_full_search():
             search_data = csv_data
         
         # Search across all text columns
-        text_columns = search_data.select_dtypes(include=['object']).columns
+        text_columns = search_data.select_dtypes(include=['object', 'string']).columns
         mask = pd.Series([False] * len(search_data))
         
         for col in text_columns:
@@ -692,7 +891,7 @@ def get_filter_options():
                     }
         
         # Keyword suggestions based on common terms
-        text_cols = analysis_data.select_dtypes(include=['object']).columns
+        text_cols = analysis_data.select_dtypes(include=['object', 'string']).columns
         common_terms = []
         
         for col in text_cols[:3]:  # Analyze first 3 text columns
