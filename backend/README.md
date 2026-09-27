@@ -1,5 +1,7 @@
 # Python CSV Backend - Smart Data Filtering & Analysis
 
+> **See the [main README](../README.md)** for setup, the Keyword Snippets / SIC industry filter / EDGAR link features, the Kaggle 8-K dataset, troubleshooting, and the full, current API list (`/api/snippets`, `/api/snippets/export`, `/api/sic_codes`). This file describes the original backend.
+
 A powerful Python backend that efficiently processes large CSV files and provides intelligent filtering capabilities for your CSV analyzer frontend.
 
 ##  Features
