@@ -62,7 +62,7 @@ def _preview_records(df):
 
 
 def _resolve_user_path(raw):
-    """Accept paths the way people paste them: quoted, shell-escaped (My\ Files), ~/..., or file:// URLs."""
+    """Accept paths the way people paste them: quoted, shell-escaped (backslash before spaces), ~/..., or file:// URLs."""
     from urllib.parse import unquote, urlparse
     p = str(raw or '').strip()
     if len(p) >= 2 and p[0] == p[-1] and p[0] in '"\'':
