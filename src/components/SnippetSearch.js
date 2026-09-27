@@ -1,9 +1,15 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { Download, Search } from 'lucide-react';
 
 const BACKEND_URL = 'http://localhost:5001';
 const PAGE_SIZE = 50;
 const DEFAULT_TERMS = 'ARPU, average revenue per user';
+const SIC_PRESETS = [
+  { label: 'Software & internet', value: '7370-7379' },
+  { label: 'Communications (telecom, cable, broadcast)', value: '48' },
+  { label: 'Cable & streaming', value: '4841, 7841' },
+  { label: 'Media & publishing', value: '27' },
+];
 
 const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
@@ -44,6 +50,30 @@ const SnippetSearch = ({ backendMode }) => {
   const [windowSize, setWindowSize] = useState(50);
   const [company, setCompany] = useState('');
   const [filingType, setFilingType] = useState('');
+  const [sic, setSic] = useState('');
+  const [sicCodes, setSicCodes] = useState([]);
+
+  useEffect(() => {
+    if (!backendMode) return;
+    fetch(`${BACKEND_URL}/api/sic_codes`)
+      .then(r => (r.ok ? r.json() : { codes: [] }))
+      .then(d => setSicCodes(d.codes || []))
+      .catch(() => setSicCodes([]));
+  }, [backendMode]);
+
+  const sicHint = useMemo(() => {
+    const tokens = sic.split(/[,;\s]+/).filter(Boolean);
+    if (!tokens.length || !sicCodes.length) return '';
+    const test = (code) => tokens.some(t => {
+      const m = t.match(/^(\d{1,4})-(\d{1,4})$/);
+      if (m) { const n = +code; return n >= +m[1].padEnd(4, '0') && n <= +m[2].padEnd(4, '9'); }
+      return /^\d+$/.test(t) && code.startsWith(t);
+    });
+    const hits = sicCodes.filter(c => test(c.sic));
+    if (!hits.length) return 'No SEC SIC codes match';
+    const shown = hits.slice(0, 4).map(c => `${c.sic} ${c.description}`).join('; ');
+    return `${hits.length} code${hits.length > 1 ? 's' : ''}: ${shown}${hits.length > 4 ? '; …' : ''}`;
+  }, [sic, sicCodes]);
   const [result, setResult] = useState(null);
   const [activeQuery, setActiveQuery] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -58,7 +88,7 @@ const SnippetSearch = ({ backendMode }) => {
   const buildBody = (query, page) => ({
     terms: query.terms,
     window: query.window,
-    filters: { company: query.company, filingType: query.filingType },
+    filters: { company: query.company, filingType: query.filingType, sic: query.sic },
     page,
     page_size: PAGE_SIZE,
   });
@@ -93,7 +123,7 @@ const SnippetSearch = ({ backendMode }) => {
 
   const onSubmit = (e) => {
     e.preventDefault();
-    runSearch({ terms, window: Number(windowSize) || 50, company, filingType }, 1);
+    runSearch({ terms, window: Number(windowSize) || 50, company, filingType, sic }, 1);
   };
 
   const exportCsv = async () => {
@@ -170,7 +200,27 @@ const SnippetSearch = ({ backendMode }) => {
             <label>Form type (optional)</label>
             <input type="text" value={filingType} onChange={(e) => setFilingType(e.target.value)} placeholder="10-K, 8-K, 6-K..." />
           </div>
+          <div className="filter-group" style={{ flex: 1.4 }}>
+            <label>Industry, SIC code (optional)</label>
+            <input type="text" list="sic-code-options" value={sic} onChange={(e) => setSic(e.target.value)}
+              placeholder="e.g. 7370-7379, 48, 4841" />
+            <datalist id="sic-code-options">
+              {sicCodes.map(c => <option key={c.sic} value={c.sic}>{`${c.sic} ${c.description}`}</option>)}
+            </datalist>
+          </div>
         </div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', alignItems: 'center', fontSize: '0.8rem', color: '#555' }}>
+          <span>Industry presets:</span>
+          {SIC_PRESETS.map(p => (
+            <button key={p.label} type="button" onClick={() => setSic(p.value)}
+              style={{ border: '1px solid #cbd5e1', background: sic === p.value ? '#dbeafe' : '#fff', borderRadius: '999px', padding: '2px 10px', cursor: 'pointer', fontSize: '0.8rem' }}>
+              {p.label} ({p.value})
+            </button>
+          ))}
+          {sic && <button type="button" onClick={() => setSic('')}
+            style={{ border: 'none', background: 'none', color: '#2563eb', cursor: 'pointer', fontSize: '0.8rem' }}>clear</button>}
+        </div>
+        {sicHint && <div style={{ fontSize: '0.78rem', color: '#6b7280' }}>{sicHint}. Codes match as prefixes; ranges like 7370-7379 work.</div>}
         <div className="filter-row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
           <div style={{ display: 'flex', gap: '8px' }}>
             <button type="submit" className="btn btn-primary" disabled={loading || !terms.trim()}>
@@ -183,7 +233,7 @@ const SnippetSearch = ({ backendMode }) => {
           </div>
           {result && (
             <div style={{ fontSize: '0.85rem', color: '#444' }}>
-              {result.total_snippets.toLocaleString()} snippets in {result.total_documents.toLocaleString()} documents
+              {result.total_snippets.toLocaleString()} snippet{result.total_snippets === 1 ? '' : 's'} in {result.total_documents.toLocaleString()} document{result.total_documents === 1 ? '' : 's'}
             </div>
           )}
         </div>
@@ -200,6 +250,16 @@ const SnippetSearch = ({ backendMode }) => {
         </div>
       )}
 
+      {result && !result.sic_source && (
+        <div style={{ background: '#fef3c7', border: '1px solid #d97706', borderRadius: '6px', padding: '8px 12px', margin: '12px 0', fontSize: '0.85rem', color: '#92400e' }}>
+          This file has no CIK or company-name column, so SEC industry codes can't be matched{activeQuery?.sic ? ' and the SIC filter excluded every row' : ''}.
+        </div>
+      )}
+      {result && result.sic_source === 'name' && (
+        <div style={{ fontSize: '0.8rem', color: '#6b7280', margin: '8px 0' }}>
+          SIC codes matched by company name (column “{result.sic_source_column}”) because the file has no CIK column. A CIK column gives exact matches.
+        </div>
+      )}
       {result && result.total_snippets === 0 && (
         <p style={{ color: '#666' }}>No matches for {result.terms.join(', ')}.</p>
       )}
@@ -213,6 +273,7 @@ const SnippetSearch = ({ backendMode }) => {
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', flexWrap: 'wrap', marginBottom: '6px' }}>
                   <strong style={{ fontSize: '0.9rem' }}>{primary.join(' · ') || `Row ${s._row}`}</strong>
                   <span style={{ fontSize: '0.75rem', color: '#6b7280' }}>
+                    {s._sic && <span title={s._sic_description} style={{ background: '#eef2ff', color: '#3730a3', borderRadius: '4px', padding: '1px 6px', marginRight: '6px' }}>SIC {s._sic} · {s._sic_description}</span>}
                     row {s._row} · column {s._column} · {s._matched}{s._hits > 1 ? ` (${s._hits} hits)` : ''}
                   </span>
                 </div>

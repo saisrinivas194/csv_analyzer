@@ -389,6 +389,109 @@ def _normalize_filters(filters, columns):
     return out
 
 
+# ---------------------------------------------------------------------------
+# SIC (industry) codes: SEC lookup keyed by CIK, see backend/refresh_sic.py
+# ---------------------------------------------------------------------------
+_SIC_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'sec_sic_lookup.csv')
+_sic_lookup = None
+_NAME_SUFFIXES = {'INC', 'INCORPORATED', 'CORP', 'CORPORATION', 'CO', 'COMPANY', 'LTD', 'LIMITED',
+                  'LLC', 'PLC', 'LP', 'LLP', 'SA', 'NV', 'AG', 'THE'}
+
+
+def _norm_company_name(name):
+    words = re.sub(r'[^A-Z0-9 ]+', ' ', str(name).upper().replace('&', ' AND ')).split()
+    while words and words[-1] in _NAME_SUFFIXES:
+        words.pop()
+    if words and words[0] == 'THE':
+        words = words[1:]
+    return ' '.join(words)
+
+
+def _load_sic_lookup():
+    global _sic_lookup
+    if _sic_lookup is not None:
+        return _sic_lookup
+    by_cik, by_name, codes = {}, {}, []
+    if os.path.exists(_SIC_PATH):
+        df = pd.read_csv(_SIC_PATH, dtype=str, keep_default_na=False)
+        for cik, sic, desc, name in zip(df['cik'], df['sic'], df['sic_description'], df['name']):
+            by_cik[int(cik)] = (sic, desc)
+            key = _norm_company_name(name)
+            if key:
+                # a name shared by companies in different industries is ambiguous -> no match
+                by_name[key] = (sic, desc) if by_name.get(key, (sic, desc)) == (sic, desc) else None
+        grouped = df.groupby('sic').agg(description=('sic_description', 'first'), companies=('cik', 'size')).reset_index()
+        codes = grouped.sort_values('sic').to_dict('records')
+    else:
+        logger.warning(f"SIC lookup not found at {_SIC_PATH}; industry filter disabled")
+    _sic_lookup = {'by_cik': by_cik, 'by_name': by_name, 'codes': codes}
+    return _sic_lookup
+
+
+def _to_cik(value):
+    digits = re.sub(r'\D', '', str(value).split('.')[0]) if value is not None else ''
+    return int(digits) if digits else None
+
+
+def _sic_source_column(columns):
+    """Pick how to assign SIC codes to rows: the file's own SIC column, else CIK, else company name."""
+    lower = {str(c).lower(): c for c in columns}
+    for name in ('sic', 'sic_code', 'siccode', 'sic code'):
+        if name in lower:
+            return 'sic', lower[name]
+    for c in columns:
+        if 'cik' in str(c).lower():
+            return 'cik', c
+    for kw in ('company', 'registrant', 'entity'):
+        for c in columns:
+            if kw in str(c).lower() and 'id' not in str(c).lower():
+                return 'name', c
+    return None, None
+
+
+def _sic_for_chunk(chunk, source):
+    """Return a list of (sic, description) per row (('', '') when unknown)."""
+    kind, col = source
+    lk = _load_sic_lookup()
+    code_desc = {c['sic']: c['description'] for c in lk['codes']}
+    out = []
+    for v in (chunk[col] if col is not None else [None] * len(chunk)):
+        hit = None
+        if kind == 'sic' and v is not None and str(v).strip() not in ('', 'nan'):
+            code = str(v).split('.')[0].strip().zfill(4)
+            hit = (code, code_desc.get(code, ''))
+        elif kind == 'cik':
+            cik = _to_cik(v)
+            hit = lk['by_cik'].get(cik) if cik is not None else None
+        elif kind == 'name' and v is not None:
+            hit = lk['by_name'].get(_norm_company_name(v))
+        out.append(hit or ('', ''))
+    return out
+
+
+def _parse_sic_filter(raw):
+    """'7370-7379, 48, 4841' -> predicate on a 4-digit SIC string. Plain entries match as prefixes."""
+    tests = []
+    for tok in re.split(r'[,\s;]+', str(raw or '').strip()):
+        if not tok:
+            continue
+        m = re.fullmatch(r'(\d{1,4})\s*-\s*(\d{1,4})', tok)
+        if m:
+            lo, hi = int(m.group(1).ljust(4, '0')), int(m.group(2).ljust(4, '9'))
+            tests.append(lambda code, lo=lo, hi=hi: code.isdigit() and lo <= int(code) <= hi)
+        elif tok.isdigit():
+            tests.append(lambda code, p=tok: code.startswith(p))
+    if not tests:
+        return None
+    return lambda code: bool(code) and any(t(code) for t in tests)
+
+
+@app.route('/api/sic_codes', methods=['GET'])
+def sic_codes_endpoint():
+    lk = _load_sic_lookup()
+    return jsonify({'codes': lk['codes'], 'companies': len(lk['by_cik'])})
+
+
 def run_snippet_search(terms, n_words, filters):
     """Stream the whole file and collect every snippet (cached for the last query)."""
     source_path = file_info.get('full_file_path') if file_info else None
@@ -402,23 +505,30 @@ def run_snippet_search(terms, n_words, filters):
     else:
         source = [csv_data.copy()]
 
-    results, text_cols, meta_cols = [], None, None
+    sic_test = _parse_sic_filter(filters.get('sic'))
+    other_filters = {k: v for k, v in filters.items() if k != 'sic'}
+    results, text_cols, meta_cols, sic_source = [], None, None, (None, None)
     for chunk in source:
         if text_cols is None:
             text_cols = _detect_text_columns(chunk) or list(chunk.select_dtypes(include=['object', 'string']).columns)
             meta_cols = [c for c in chunk.columns if c not in text_cols]
-        chunk = _apply_filters_to_chunk(chunk, {k: v for k, v in _normalize_filters(filters, chunk.columns).items() if k != 'search'})
-        for idx, row in chunk.iterrows():
+            sic_source = _sic_source_column(chunk.columns)
+        chunk = _apply_filters_to_chunk(chunk, {k: v for k, v in _normalize_filters(other_filters, chunk.columns).items() if k != 'search'})
+        sics = _sic_for_chunk(chunk, sic_source)
+        for (idx, row), (sic, sic_desc) in zip(chunk.iterrows(), sics):
+            if sic_test and not sic_test(sic):
+                continue
             for col in text_cols:
                 for snippet, hits in extract_snippets(row.get(col), pattern, n_words):
                     rec = {c: row[c] for c in meta_cols}
-                    rec.update({'_row': int(idx) + 1, '_column': col,
+                    rec.update({'_row': int(idx) + 1, '_column': col, '_sic': sic, '_sic_description': sic_desc,
                                 '_matched': ', '.join(sorted({h.lower() for h in hits})),
                                 '_hits': len(hits), '_snippet': snippet})
                     results.append(rec)
 
-    _snippet_cache.update(key=key, results=results, meta_columns=meta_cols or [])
-    return results, meta_cols or []
+    info = {'meta_columns': meta_cols or [], 'sic_source': sic_source[0], 'sic_source_column': sic_source[1]}
+    _snippet_cache.update(key=key, results=results, meta_columns=info)
+    return results, info
 
 
 def _snippet_params():
@@ -436,7 +546,7 @@ def snippets_endpoint():
     if not terms:
         return jsonify({'error': 'Enter at least one search term'}), 400
     try:
-        results, meta_cols = run_snippet_search(terms, n_words, filters)
+        results, info = run_snippet_search(terms, n_words, filters)
         page = max(1, int(body.get('page', 1)))
         page_size = max(1, min(int(body.get('page_size', 50)), 500))
         start = (page - 1) * page_size
@@ -446,7 +556,10 @@ def snippets_endpoint():
             'total_documents': len({r['_row'] for r in results}),
             'total_pages': max(1, -(-len(results) // page_size)),
             'page': page,
-            'meta_columns': meta_cols,
+            'meta_columns': info['meta_columns'],
+            'sic_source': info['sic_source'],
+            'sic_source_column': info['sic_source_column'],
+            'snippets_without_sic': sum(1 for r in results if not r['_sic']),
             'terms': terms,
             'window': n_words,
         })
@@ -463,9 +576,11 @@ def snippets_export():
     if not terms:
         return jsonify({'error': 'Enter at least one search term'}), 400
     try:
-        results, meta_cols = run_snippet_search(terms, n_words, filters)
-        df = pd.DataFrame(results, columns=meta_cols + ['_row', '_column', '_matched', '_hits', '_snippet'])
-        df = df.rename(columns={'_row': 'source_row', '_column': 'text_column', '_matched': 'matched_terms',
+        results, info = run_snippet_search(terms, n_words, filters)
+        meta_cols = info['meta_columns']
+        df = pd.DataFrame(results, columns=meta_cols + ['_sic', '_sic_description', '_row', '_column', '_matched', '_hits', '_snippet'])
+        df = df.rename(columns={'_sic': 'sec_sic_code', '_sic_description': 'sec_sic_description',
+                                '_row': 'source_row', '_column': 'text_column', '_matched': 'matched_terms',
                                 '_hits': 'hits_in_snippet', '_snippet': f'snippet_{n_words}_words_each_side'})
         output = io.StringIO()
         df.to_csv(output, index=False)
